@@ -1,0 +1,15 @@
+{
+    "keep": {
+        "days": true,
+        "amount": 14
+    },
+    "auditLog": "/home/evgeny/Mi progi githab/Experiment 0.1 bit-weight/logs/.9339abdd94cbdf23991c3c9cd3ccdd82605ebc07-audit.json",
+    "files": [
+        {
+            "date": 1776815118170,
+            "name": "/home/evgeny/Mi progi githab/Experiment 0.1 bit-weight/logs/mcp-puppeteer-2026-04-22.log",
+            "hash": "bec2920b582415d277e5e2dd9e8f319c2689b1a7a22b6ece2b6440821d507376"
+        }
+    ],
+    "hashType": "sha256"
+}

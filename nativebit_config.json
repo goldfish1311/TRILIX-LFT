@@ -1,0 +1,372 @@
+{
+  "_meta": {
+    "name": "NativeBit-LFT",
+    "version": "1.0.0",
+    "bpw": 0.1,
+    "paradigm": "NATIVE_BINARY_FROM_SCRATCH",
+    "description": "Модель, у которой бинарные факторные веса — это ЕДИНСТВЕННЫЙ формат с шага 0. Никакого FP16 предобучения. Никакой прогрессивной квантизации. W = diag(h) · U_sign · diag(l) · V_sign^T · diag(g). U_sign и V_sign — всегда {±1}. Обучение через STE с самого начала.",
+    "prior_art": [
+      "BitNet (Wang et al., 2023) — 1-bit transformer from scratch",
+      "BitNet b1.58 (Ma et al., 2024) — ternary {-1,0,+1} from scratch, no FP16 ever",
+      "OneBit (NeurIPS 2024) — SVD-факторизация 1-bit",
+      "LittleBit (NeurIPS 2025) — sub-0.1 BPW via latent factorization"
+    ],
+    "_key_insight": "BitNet b1.58 доказал: STE-обучение бинарных весов с нуля работает. LittleBit доказал: 0.1 BPW через латентную факторизацию сохраняет качество. NativeBit-LFT объединяет оба принципа — бинарная факторизация КАК АРХИТЕКТУРА, не как квантизация."
+  },
+
+  "weight_representation": {
+    "_THIS_IS_THE_CORE": "Это не квантизация поверх FP16. Это АРХИТЕКТУРА слоя. Такого FP16 веса не существует вообще.",
+
+    "formula": "W_eff = diag(h) · U_sign · diag(l) · V_sign^T · diag(g)",
+    "forward_pass": "y = h ⊙ (U_sign · (l ⊙ (V_sign^T · (g ⊙ x))))",
+
+    "components": {
+      "U_sign": {
+        "shape": "[d_out, r]",
+        "dtype": "uint1_bitpacked",
+        "values": "{-1, +1} — хранится как int8, упаковано по 8 бит",
+        "is_trainable": true,
+        "gradient_method": "STE",
+        "_note": "Нет FP16-копии U. Только бинарный тензор. В памяти: d_out × r / 8 байт."
+      },
+      "V_sign": {
+        "shape": "[d_in, r]",
+        "dtype": "uint1_bitpacked",
+        "values": "{-1, +1}",
+        "is_trainable": true,
+        "gradient_method": "STE",
+        "_note": "Нет FP16-копии V. Только бинарный тензор."
+      },
+      "h_row_scale": {
+        "shape": "[d_out]",
+        "dtype": "bfloat16",
+        "is_trainable": true,
+        "gradient_method": "standard_autograd",
+        "_note": "Шкалы — единственное что обучается через стандартный autograd. Это главные носители информации."
+      },
+      "g_col_scale": {
+        "shape": "[d_in]",
+        "dtype": "bfloat16",
+        "is_trainable": true,
+        "gradient_method": "standard_autograd"
+      },
+      "l_latent_scale": {
+        "shape": "[r]",
+        "dtype": "bfloat16",
+        "is_trainable": true,
+        "gradient_method": "standard_autograd",
+        "_note": "Латентная шкала — ключевое изобретение LittleBit. Взвешивает каждое из r направлений."
+      }
+    },
+
+    "dual_path": {
+      "enabled": true,
+      "paths": ["primary", "residual"],
+      "output": "W_eff = W_primary + W_residual",
+      "_memory_note": "Два пути, но rank у каждого вдвое меньше → суммарный BPW тот же",
+      "_why": "Residual path захватывает информацию, которую primary не смог — без увеличения BPW"
+    },
+
+    "bpw_calculation": {
+      "_formula": "BPW = (d_out × r + d_in × r) / (d_out × d_in) = r × (d_out + d_in) / (d_out × d_in)",
+      "_for_square_matrix": "BPW ≈ 2r / d",
+      "scale_overhead": "negligible — шкалы (d_out + d_in + r) векторов << d_out × d_in матрица"
+    }
+  },
+
+  "model_sizes": {
+    "_note": "Три варианта. Выбирай под задачу. Все — нативный 0.1 BPW с шага 0.",
+
+    "nano": {
+      "_use_case": "Эксперименты на RTX 3090. Быстрые итерации. autoresearch-совместимый.",
+      "hidden_size": 1024,
+      "num_layers": 16,
+      "num_heads": 16,
+      "num_kv_heads": 4,
+      "head_dim": 64,
+      "intermediate_size": 4096,
+      "rank_per_path": 52,
+      "_rank_derivation": "r = 1024 × 0.1 / 2 = 51.2 → 52",
+      "nominal_params": "~0.35B",
+      "binary_weights_mb": 4.3,
+      "scale_factors_mb": 1.1,
+      "embeddings_bf16_mb": 262,
+      "total_inference_mb": 268,
+      "training_vram_estimate_gb": 3.5,
+      "_training_note": "Комфортно тренируется на 3090 с batch=16, seq=2048"
+    },
+
+    "small": {
+      "_use_case": "Серьёзный baseline. Тренировка на 3090 с gradient checkpointing.",
+      "hidden_size": 2048,
+      "num_layers": 24,
+      "num_heads": 16,
+      "num_kv_heads": 4,
+      "head_dim": 128,
+      "intermediate_size": 8192,
+      "rank_per_path": 102,
+      "_rank_derivation": "r = 2048 × 0.1 / 2 = 102.4 → 102",
+      "nominal_params": "~2.1B",
+      "binary_weights_mb": 32,
+      "scale_factors_mb": 6,
+      "embeddings_bf16_mb": 524,
+      "total_inference_mb": 562,
+      "training_vram_estimate_gb": 10,
+      "_training_note": "Тренируется на 3090 с gradient checkpointing, seq=2048, batch=4"
+    },
+
+    "medium": {
+      "_use_case": "Production-ready. Инференс на 3090. Тренировка на A100/H100.",
+      "hidden_size": 4096,
+      "num_layers": 32,
+      "num_heads": 32,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "intermediate_size": 14336,
+      "rank_per_path": 205,
+      "_rank_derivation": "r = 4096 × 0.1 / 2 = 204.8 → 205",
+      "nominal_params": "~7.2B",
+      "binary_weights_mb": 248,
+      "scale_factors_mb": 54,
+      "embeddings_bf16_mb": 1048,
+      "total_inference_mb": 1350,
+      "total_inference_gb": 1.35,
+      "training_vram_estimate_gb": 24,
+      "_training_note": "Инференс влезает на 3090 (24 GB). Тренировка требует A100/4× 3090."
+    }
+  },
+
+  "architecture": {
+    "_comment": "Модернизированный Transformer. Все линейные слои заменены на NativeBit-Linear.",
+
+    "layer_structure": "pre_norm_transformer",
+    "normalization": {
+      "type": "rmsnorm",
+      "eps": 1e-5,
+      "weight_dtype": "float32",
+      "_critical": "RMSNorm в FP32 — нельзя бинаризовать. Это маяк стабильности в море бинарных операций."
+    },
+
+    "attention": {
+      "type": "grouped_query_attention",
+      "flash_attention": true,
+      "dropout": 0.0,
+      "positional_encoding": {
+        "type": "rope",
+        "theta": 500000.0
+      },
+      "_all_projections_are_nativebit": "q_proj, k_proj, v_proj, o_proj — все NativeBit-Linear",
+      "kv_cache_mode": "latent",
+      "_kv_cache_explanation": "Кэшируем V_sign^T · (g ⊙ x) ∈ R^r вместо полного K,V ∈ R^{d_model}. Экономия ~20-40x."
+    },
+
+    "feedforward": {
+      "type": "swiglu",
+      "activation": "silu",
+      "_all_projections_are_nativebit": "gate_proj, up_proj, down_proj — все NativeBit-Linear"
+    },
+
+    "non_binary_components": {
+      "_critical_note": "Эти компоненты НЕЛЬЗЯ бинаризовать без катастрофических потерь:",
+      "embeddings": {
+        "dtype": "bfloat16",
+        "_reason": "Lookup-table, не матричное умножение. Бинаризация = полная потеря семантики токенов."
+      },
+      "lm_head": {
+        "dtype": "bfloat16",
+        "_reason": "Финальный logit слой. Любая ошибка здесь — прямой ущерб PPL и качеству сэмплирования."
+      },
+      "rms_norm_weights": {
+        "dtype": "float32"
+      },
+      "rope_frequencies": {
+        "dtype": "float32"
+      }
+    }
+  },
+
+  "training": {
+    "_philosophy": "STE с шага 0. Никакого warm-up в FP16. Шкалы учатся быстро — они компенсируют бинарность. Бинарные факторы эволюционируют медленно через STE.",
+
+    "gradient_estimator": {
+      "type": "straight_through_estimator",
+      "variant": "clipped_ste",
+      "clip_value": 1.0,
+      "_formula": "∂L/∂W_latent = ∂L/∂W_sign · 1[|W_latent| ≤ 1]",
+      "_why_clipped": "Без clip STE даёт взрывные градиенты для весов далеко от {±1}. Clip стабилизирует."
+    },
+
+    "optimizer": {
+      "type": "adamw",
+      "_autoresearch_compat": "autoresearch использует Muon + AdamW. Рекомендую AdamW для scale-факторов, Muon для binary-латентных.",
+
+      "scale_factors_group": {
+        "params": ["h_row_scale", "g_col_scale", "l_latent_scale"],
+        "lr": 3e-3,
+        "_lr_note": "В 10x выше базового. Шкалы — главные носители градиентного сигнала в бинарной сети.",
+        "weight_decay": 0.0,
+        "optimizer": "adamw",
+        "betas": [0.9, 0.95]
+      },
+
+      "binary_latent_group": {
+        "params": ["U_sign_latent", "V_sign_latent"],
+        "_note": "Для STE нужен 'теневой' float тензор W_latent, который накапливает градиенты. sign(W_latent) = U_sign/V_sign.",
+        "lr": 3e-4,
+        "weight_decay": 0.0,
+        "optimizer": "adamw",
+        "betas": [0.9, 0.95]
+      },
+
+      "embeddings_and_head_group": {
+        "params": ["token_embeddings", "lm_head"],
+        "lr": 3e-4,
+        "weight_decay": 0.1,
+        "optimizer": "adamw"
+      },
+
+      "norms_group": {
+        "params": ["all_rmsnorm_weights"],
+        "lr": 3e-4,
+        "weight_decay": 0.0
+      }
+    },
+
+    "lr_schedule": {
+      "type": "cosine_with_warmup",
+      "warmup_steps": 2000,
+      "warmup_type": "linear",
+      "min_lr_fraction": 0.1
+    },
+
+    "gradient_clipping": {
+      "max_norm": 1.0,
+      "apply_to": "scale_factors_only",
+      "_binary_note": "Бинарные факторы не клипируются — STE и так ограничивает их через sign()"
+    },
+
+    "memory_config_for_rtx3090": {
+      "_target": "Nano и Small модели тренируются на одном RTX 3090",
+      "gradient_checkpointing": true,
+      "checkpointing_granularity": "every_layer",
+      "mixed_precision": "bfloat16",
+      "_optimizer_states": "FP32 только для scale-факторов (маленькие векторы). Binary латентные тензоры — BF16 shadow.",
+      "estimated_peak_vram_nano": "3.5 GB",
+      "estimated_peak_vram_small": "10 GB",
+      "batch_size_nano_3090": 16,
+      "batch_size_small_3090": 4,
+      "seq_len": 2048,
+      "_3090_note": "RTX 3090 (24 GB) — комфортная тренировка Nano/Small. Medium требует multi-GPU."
+    },
+
+    "loss": {
+      "primary": "cross_entropy",
+      "moe_load_balancing": {
+        "enabled": false,
+        "_note": "MoE убран из базовой конфигурации — усложняет STE-обучение. Добавить в v2 после стабилизации."
+      }
+    },
+
+    "autoresearch_compatibility": {
+      "single_file_trainable": true,
+      "fixed_time_budget_compatible": true,
+      "metric": "val_bpb",
+      "_program_md_hint": "В program.md укажи: 'Все линейные слои — NativeBit-Linear с STE. Оптимизируй rank r, lr шкал, clip-value STE. Не трогай dtype весов — они бинарные по архитектуре.'",
+      "fork_recommendations": [
+        "jsegov/autoresearch-win-rtx для Windows + RTX 3090",
+        "При форке — заменить стандартный nn.Linear на NativeBitLinear во всех блоках"
+      ]
+    }
+  },
+
+  "initialization": {
+    "_philosophy": "Нет претренированных весов. Нет SVD. Начинаем с математически обоснованного random.",
+
+    "U_sign_init": {
+      "strategy": "random_bernoulli_balanced",
+      "description": "Для каждого вектора-строки u_i ∈ R^r: заполнить ±1 равновероятно. Гарантирует E[U_sign] = 0.",
+      "implementation": "torch.sign(torch.randn(d_out, r))"
+    },
+
+    "V_sign_init": {
+      "strategy": "quasi_orthogonal_random",
+      "description": "Сначала torch.randn(d_in, r), затем QR-декомпозиция для ортогональности, затем sign(). Уменьшает начальную реконструкционную ошибку.",
+      "implementation": "torch.sign(torch.linalg.qr(torch.randn(d_in, r))[0])"
+    },
+
+    "h_row_scale_init": {
+      "strategy": "kaiming_magnitude_aware",
+      "formula": "h_i = sqrt(d_in / r) / sqrt(d_out)",
+      "_reason": "Сохраняет дисперсию активаций как у стандартного Kaiming init при бинарных весах"
+    },
+
+    "g_col_scale_init": {
+      "strategy": "uniform_ones_with_noise",
+      "formula": "g_j = 1.0 + 0.01 * N(0,1)",
+      "_reason": "Начинаем нейтрально, малый шум ломает симметрию"
+    },
+
+    "l_latent_scale_init": {
+      "strategy": "inverse_rank_decay",
+      "formula": "l_k = 1.0 / sqrt(k + 1) для k = 0..r-1",
+      "_reason": "Имитирует SVD-спектр: первые латентные направления важнее. Ускоряет сходимость.",
+      "_note": "Это самая умная часть инициализации — без pretrained SVD мы вручную задаём приоритет направлений"
+    },
+
+    "residual_path_init": {
+      "U_sign": "random_bernoulli_balanced",
+      "V_sign": "random_bernoulli_balanced",
+      "scales": "multiply_primary_scales_by_0.1",
+      "_reason": "Residual начинает малым — растёт только когда primary недостаточен"
+    },
+
+    "embeddings_init": "normal(0, 0.006)",
+    "lm_head_init": "normal(0, 0.006)",
+    "rmsnorm_init": "ones"
+  },
+
+  "inference": {
+    "kernel": "binary_xnor_popcount_gemv",
+    "_kernel_note": "XNOR+popcount реализует U_sign · x за ~8-12x быстрее FP16 GEMV. Нужен кастомный CUDA/Triton kernel.",
+    "kv_cache": "latent_dim_r",
+    "dtype": "bfloat16_scales_uint1_binary",
+    "vram_medium_model_gb": 1.35,
+    "throughput_rtx3090_tokens_per_sec": "~65-90",
+    "_fits_on_3090": true
+  },
+
+  "risks": {
+    "r1_ste_gradient_noise": {
+      "severity": "HIGH",
+      "what": "STE — биassed estimator. Градиенты через sign() приближённые. Сходимость медленнее FP16.",
+      "mitigation": "Высокий LR шкал (3e-3). Clip-value STE = 1.0. Patience — нужно больше шагов чем FP16 модели."
+    },
+    "r2_embedding_dominates_size": {
+      "severity": "MEDIUM",
+      "what": "BF16 embeddings — самая большая часть модели (1 GB для medium). Это не бинаризовано.",
+      "mitigation": "Post-training 4-bit embedding quant снижает до ~250 MB без заметной потери PPL."
+    },
+    "r3_quality_ceiling": {
+      "severity": "MEDIUM",
+      "what": "0.1 BPW ≠ 7B FP16. Информационная ёмкость физически ограничена.",
+      "honest_expectation": "Medium (7B nominal, 1.35 GB) ≈ качество 1-2B FP16 dense модели. Nano — GPT-2 уровень.",
+      "mitigation": "Увеличь r (rank). r×2 → BPW×2 → качество ↑↑. Компромисс: 0.2 BPW = качество 3-4B."
+    },
+    "r4_no_proven_from_scratch_recipe": {
+      "severity": "HIGH",
+      "what": "LittleBit доказан только как PTQ/QAT-поверх-FP16. Pure from-scratch 0.1 BPW — frontier research.",
+      "honest_note": "BitNet b1.58 (1.58 BPW) from-scratch работает. 0.1 BPW from-scratch — никто публично не доказал. Это эксперимент.",
+      "mitigation": "autoresearch идеально подходит именно для этого — агент сам найдёт правильные гиперпараметры."
+    }
+  },
+
+  "recommended_experiment_sequence": {
+    "_for_autoresearch": "Отдай агенту program.md с этими инструкциями — пусть итерирует",
+    "step_1": "Nano модель, rank=52, val_bpb baseline с текущим STE clip=1.0",
+    "step_2": "Поиск оптимального lr шкал (диапазон 1e-3 ... 1e-2)",
+    "step_3": "Поиск оптимального clip-value STE (0.5, 1.0, 1.5, 2.0)",
+    "step_4": "Сравнить dual-path (r=26+26) vs single-path (r=52) при одинаковом BPW",
+    "step_5": "Найти оптимальное l_latent_scale_init (inverse_decay vs uniform vs ones)",
+    "step_6": "Масштабировать лучшие гиперпараметры на Small модель"
+  }
+}

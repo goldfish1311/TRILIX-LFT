@@ -1,0 +1,27 @@
+TRILIX Training - Starting on cuda
+GPU: NVIDIA GeForce RTX 3090
+VRAM: 25.3 GB
+
+Target BPW: 0.0048
+Model: 1024d, 16L, rank=64
+
+Model created successfully!
+Parameters: 89,190,400
+
+Training config:
+  Batch size: 8
+  Seq length: 256
+  Gradient accumulation: 16
+  Effective batch: 128
+  Max steps: 1000
+
+============================================================
+Training started! Press Ctrl+C to stop.
+============================================================
+
+Step   10/1000 | Loss: 619.5347 | CE: 10.40 | Tok/s: 1518
+  ⚠️  Dead atoms: 3584/3584 — codebook collapse risk!
+Step   20/1000 | Loss: 616.9666 | CE: 10.40 | Tok/s: 1566
+  ⚠️  Dead atoms: 3584/3584 — codebook collapse risk!
+Step   30/1000 | Loss: 614.2142 | CE: 10.39 | Tok/s: 1584
+  ⚠️  Dead atoms: 3584/3584 — codebook collapse risk!

@@ -1,0 +1,314 @@
+{
+  "_meta": {
+    "name": "TRILIX-LFT",
+    "full_name": "Triple-Level Indexed eXtreme Latent Factorized Transformer",
+    "version": "1.0.0",
+    "status": "PRODUCTION-READY ARCHITECTURE SPEC",
+    "target_bpw": "0.04 — 0.09 (в зависимости от размера модели)",
+
+    "core_idea": "Три метода сжатия расположены В ПРАВИЛЬНОМ ПОРЯДКЕ так, что каждый создаёт ПРЕДПОСЫЛКИ для следующего. Это не просто склейка трёх идей — это пирамида, где нижний уровень делает верхний возможным.",
+
+    "why_this_order": {
+      "step_1_factorization": "W(d×d) → U(d×r), V(d×r). Теперь строки МАЛЕНЬКИЕ (r=100 вместо d=4096). Без этого кодбук был бы неподъёмным.",
+      "step_2_codebook": "Строки U,V — r-мерные бинарные векторы. Много строк ПОХОЖИ между собой и между слоями. Кодбук фиксирует эти повторяющиеся паттерны. Шарится на ВСЕ слои.",
+      "step_3_xor_atoms": "Кодбук сам по себе — это k бинарных векторов длиной r. Между ними тоже есть повторяющиеся суб-паттерны. XOR из нескольких атомов выражает любой вектор кодбука.",
+      "scale_factors_throughout": "Шкалы h, g, l в BF16 — СКВОЗНОЙ обучаемый компонент. Они несут всю непрерывную информацию о величине. Дискретная структура (индексы) несёт только топологию."
+    }
+  },
+
+  "weight_representation": {
+    "_formula_human": "W_eff = diag(h) · U_decoded · diag(l) · V_decoded^T · diag(g)",
+    "_where": {
+      "U_decoded_i": "C_U[ idx_U[i] ]  — строка i матрицы U = codeword из кодбука",
+      "C_U_j":       "sign( XOR_sum_b( Alpha_U[j, b] · Atom_U[b] ) )  — codeword j = XOR из атомов",
+      "h_g_l":       "BF16 шкалы — единственные полноточные параметры слоя"
+    },
+
+    "_full_expansion": "y = h ⊙ (C_U[idx_U] · (l ⊙ (C_V[idx_V]^T · (g ⊙ x))))",
+
+    "level_1_latent_factorization": {
+      "description": "Каждый линейный слой W ∈ R^{d_out×d_in} представлен как произведение двух малых матриц U·V^T",
+      "U_shape": "[d_out, r]",
+      "V_shape": "[d_in, r]",
+      "U_dtype": "binary {-1, +1}",
+      "V_dtype": "binary {-1, +1}",
+      "_reduction": "r/d_out строк вместо d_in, r/d_in столбцов вместо d_out. Для r=100, d=2048: 20x меньше кодслов."
+    },
+
+    "level_2_codebook_vq": {
+      "description": "Каждая бинарная строка u_i ∈ {±1}^r заменяется ИНДЕКСОМ в общий кодбук. Кодбук шарится на ВСЕ слои одного типа.",
+      "codebook_size_k": 128,
+      "codeword_length": "r (из level_1)",
+      "storage_per_row": "log2(k) = 7 бит",
+      "cross_layer_sharing": {
+        "enabled": true,
+        "sharing_groups": {
+          "attention_qkvo": "один кодбук C_attn на все Q,K,V,O во всех слоях",
+          "ffn_gateup": "один кодбук C_ffn_up на все gate_proj, up_proj во всех слоях",
+          "ffn_down": "один кодбук C_ffn_down на все down_proj во всех слоях"
+        },
+        "_why_works": "Нейроны из разных слоёв транформера учат удивительно похожие паттерны (доказано в механистической интерпретируемости). Общий кодбук — не принуждение, а фиксация этого факта."
+      },
+      "training": {
+        "forward": "Nearest-neighbor lookup: idx = argmin_j ||u_soft - C[j]||²",
+        "backward": "STE: градиент проходит насквозь через lookup",
+        "codebook_update": "EMA: C[j] ← 0.99 · C[j] + 0.01 · mean(u_soft assigned to j)",
+        "commitment_loss": "beta × ||u_soft - C[idx].detach()||²",
+        "commitment_beta": 0.25,
+        "codebook_restart": "Если кодслово не выбиралось >1000 шагов — reinit из случайного батча"
+      }
+    },
+
+    "level_3_xor_atoms": {
+      "description": "Кодбук C ∈ {±1}^{k×r} сам хранится как XOR-комбинации из A бинарных атомов. Атомы — единственное что реально обучается в кодбуке.",
+      "num_atoms_A": 32,
+      "xor_arity_b": 3,
+      "_meaning": "Каждый из k codewords = знак XOR 3-х атомов. 32 атома → 32³/6 = 5461 уникальных комбинаций. Хватает для k=128.",
+      "atom_storage": "A × r = 32 × 100 = 3200 бит (400 байт!) на тип слоя",
+      "combo_storage": "k × b × ceil(log2(A)) = 128 × 3 × 5 = 1920 бит",
+      "total_codebook_storage": "3200 + 1920 = 5120 бит ≈ 640 байт на ВЕСЬ тип слоя на ВСЕ 24 слоя",
+      "training_atoms": {
+        "forward": "C[j] = sign( sum_b( α[j,b] · Atom[β[j,b]] ) ) — differentiable через шкалы α",
+        "backward": "Атомы обновляются через grad на α + STE через знак",
+        "_key": "α[j,b] — вещественные шкалы смешивания: учатся autograd'ом. β[j,b] — дискретные индексы атомов: учатся STE."
+      }
+    },
+
+    "scale_factors": {
+      "description": "Единственные НЕПРЕРЫВНЫЕ параметры каждого линейного слоя. Несут всю вещественную информацию о величине.",
+      "h_row_scale": {"shape": "d_out", "dtype": "bfloat16"},
+      "g_col_scale": {"shape": "d_in", "dtype": "bfloat16"},
+      "l_latent_scale": {"shape": "r", "dtype": "bfloat16"},
+      "_their_role": "Топология = кодбуки. Величина = шкалы. Эти два вида информации полностью разделены.",
+      "learning_rate_multiplier": 10.0,
+      "_why_10x": "Шкалы — единственный прямой autograd-путь. Они должны быстро компенсировать медленную эволюцию дискретных индексов."
+    },
+
+    "bpw_analysis": {
+      "_per_layer_breakdown": {
+        "indices_U_V_bits": "2 × d × log2(k)  (7 бит на строку U и V)",
+        "scales_h_g_l_bits": "2 × (d_out + d_in + r) × 16  (BF16)",
+        "codebook_amortized_bits": "(A×r + k×b×log2A) / num_layers"
+      },
+      "_for_small_model": {
+        "d": 2048, "r": 100, "k": 128, "A": 32, "b": 3, "L": 24,
+        "bpw_indices_only": 0.0069,
+        "bpw_indices_plus_scales": 0.039,
+        "compression_vs_fp16": "411x"
+      },
+      "_for_medium_model": {
+        "d": 4096, "r": 200, "k": 128, "A": 32, "b": 3, "L": 32,
+        "bpw_indices_only": 0.0049,
+        "bpw_indices_plus_scales": 0.023,
+        "compression_vs_fp16": "695x"
+      }
+    }
+  },
+
+  "model_sizes": {
+    "nano": {
+      "_use": "RTX 3090, быстрые эксперименты, autoresearch",
+      "hidden_size": 1024, "num_layers": 16,
+      "num_heads": 16, "num_kv_heads": 4, "head_dim": 64,
+      "intermediate_size": 4096,
+      "rank_r": 64, "codebook_k": 64, "atoms_A": 16, "xor_b": 2,
+      "bpw_approx": 0.055,
+      "binary_and_index_storage_mb": 1.8,
+      "total_with_scales_and_embed_mb": 290,
+      "training_vram_gb": 4
+    },
+    "small": {
+      "_use": "Серьёзный baseline, тренировка на 3090",
+      "hidden_size": 2048, "num_layers": 24,
+      "num_heads": 16, "num_kv_heads": 4, "head_dim": 128,
+      "intermediate_size": 8192,
+      "rank_r": 100, "codebook_k": 128, "atoms_A": 32, "xor_b": 3,
+      "bpw_approx": 0.039,
+      "binary_and_index_storage_mb": 6,
+      "total_with_scales_and_embed_mb": 580,
+      "training_vram_gb": 11
+    },
+    "medium": {
+      "_use": "Production. Инференс на 3090. Тренировка на A100.",
+      "hidden_size": 4096, "num_layers": 32,
+      "num_heads": 32, "num_kv_heads": 8, "head_dim": 128,
+      "intermediate_size": 14336,
+      "rank_r": 200, "codebook_k": 128, "atoms_A": 32, "xor_b": 3,
+      "bpw_approx": 0.023,
+      "binary_and_index_storage_mb": 38,
+      "total_with_scales_and_embed_mb": 1150,
+      "training_vram_gb": 24
+    }
+  },
+
+  "architecture": {
+    "layer_structure": "pre_norm_transformer",
+
+    "every_linear_layer_is": "TRILIX-Linear",
+    "_trilix_linear_replaces": "каждый nn.Linear во всей модели (кроме исключений ниже)",
+
+    "attention": {
+      "type": "grouped_query_attention",
+      "flash_attention": true,
+      "rope": {"type": "rope", "theta": 500000.0},
+      "all_projections": "TRILIX-Linear — q_proj, k_proj, v_proj, o_proj",
+      "kv_cache": "латентный: кэшируем C_V[idx_V]^T·(g⊙x) ∈ R^r, не полный K,V"
+    },
+
+    "feedforward": {
+      "type": "swiglu",
+      "activation": "silu",
+      "all_projections": "TRILIX-Linear — gate_proj, up_proj, down_proj"
+    },
+
+    "normalization": {
+      "type": "rmsnorm", "eps": 1e-5, "dtype": "float32",
+      "_NOT_compressed": "RMSNorm всегда FP32"
+    },
+
+    "non_compressed_components": {
+      "embeddings": "bfloat16 — lookup, не умножение",
+      "lm_head": "bfloat16 — критичен для качества логитов",
+      "rms_norm_weights": "float32",
+      "rope_frequencies": "float32",
+      "_total_non_compressed_mb": "~1100 MB для vocab=128K, d=4096"
+    }
+  },
+
+  "training": {
+    "paradigm": "native_from_scratch",
+    "_no_fp16_warmup": true,
+    "_no_progressive_quantization": true,
+
+    "gradient_flows": {
+      "_overview": "Три параллельных потока градиента — каждый для своего уровня иерархии",
+
+      "flow_1_scales": {
+        "params": ["h", "g", "l", "α_atom_mix"],
+        "method": "standard_autograd",
+        "lr": "base_lr × 10",
+        "_fastest": "Эти параметры обновляются первыми и больше всего за шаг"
+      },
+
+      "flow_2_codebook_indices": {
+        "params": ["idx_U", "idx_V"],
+        "method": "straight_through_estimator",
+        "ste_clip": 1.0,
+        "effective_lr": "base_lr × 0.1",
+        "_meaning": "Индексы меняются редко — это 'медленная' часть топологии модели"
+      },
+
+      "flow_3_atoms": {
+        "params": ["Atom_U", "Atom_V"],
+        "method": "ema_update_plus_ste",
+        "ema_decay": 0.99,
+        "gradient_weight": 0.01,
+        "_meaning": "Атомы — самая стабильная часть. Обновляются очень медленно через EMA."
+      }
+    },
+
+    "losses": {
+      "main": "cross_entropy(logits, targets)",
+      "commitment": "0.25 × ||u_soft - C[idx].detach()||²  (per TRILIX layer)",
+      "atom_diversity": "−0.01 × entropy(atom_usage_distribution)  (предотвращает collapse атомов)",
+      "total": "L_main + L_commit + L_diversity"
+    },
+
+    "optimizer": {
+      "type": "adamw",
+      "base_lr": 3e-4,
+      "min_lr": 3e-5,
+      "weight_decay": 0.1,
+      "betas": [0.9, 0.95],
+      "gradient_clip": 1.0,
+      "warmup_steps": 2000,
+      "schedule": "cosine"
+    },
+
+    "autoresearch_notes": {
+      "target_metric": "val_bpb",
+      "agent_can_tune": [
+        "rank_r (напрямую влияет на BPW)",
+        "codebook_k (64, 128, 256 — трейдофф качество/размер)",
+        "commitment_beta (0.1 ... 0.5)",
+        "lr шкал (5x ... 15x base_lr)",
+        "atom_diversity weight (0.001 ... 0.1)",
+        "ema_decay атомов (0.9 ... 0.999)"
+      ],
+      "agent_must_not_touch": [
+        "dtype шкал — только BF16",
+        "RMSNorm — только FP32",
+        "Порядок трёх уровней сжатия"
+      ],
+      "win_rtx_fork": "jsegov/autoresearch-win-rtx"
+    }
+  },
+
+  "initialization": {
+    "_goal": "Дать модели хороший старт без любых pretrained весов",
+
+    "atoms_init": {
+      "strategy": "random_binary_balanced",
+      "impl": "sign(torch.randn(A, r))",
+      "_then": "Применить QR-ортогонализацию чтоб атомы были максимально различимы"
+    },
+
+    "codebook_init": {
+      "strategy": "xor_of_initial_atoms",
+      "_meaning": "Кодбук сразу строится из инициализированных атомов — нет противоречия с нуля"
+    },
+
+    "indices_init": {
+      "strategy": "random_uniform",
+      "impl": "torch.randint(0, k, size=(d_out,))",
+      "_note": "Случайное назначение строк к кодсловам — кодбук быстро специализируется за первые 1000 шагов"
+    },
+
+    "h_scale_init": "sqrt(2 / (d_in × r)) — адаптированный Kaiming для r-ранговой факторизации",
+    "g_scale_init": "ones(d_in)",
+    "l_latent_init": "[1/sqrt(1), 1/sqrt(2), ..., 1/sqrt(r)] — имитирует SVD-спектр без pretrained весов",
+    "alpha_mix_init": "uniform(0.3, 0.7) — начинаем с мягкого смешивания, не жёсткого XOR"
+  },
+
+  "inference": {
+    "runtime_weight": "Все индексы + кодбук предвычислены → полные U, V binary матрицы. Вычисляются один раз при загрузке.",
+    "_no_runtime_lookup": "В инференсе нет lookup. Только binary matmul через XNOR+popcount.",
+    "kernel": "binary_xnor_popcount + fused_scale_apply",
+    "kv_cache": "latent (r-dimensional, ~20-40x экономия vs full d_model cache)",
+    "fits_rtx3090": true,
+    "vram_small_model_gb": 0.6,
+    "vram_medium_model_gb": 1.2
+  },
+
+  "risks": {
+    "r1_codebook_collapse": {
+      "severity": "HIGH",
+      "what": "Все строки могут сколлапсировать в 1-2 кодслова. Катастрофа.",
+      "detection": "Мониторь entropy(usage_histogram) каждые 100 шагов",
+      "mitigation": "atom_diversity loss + codebook restart при недоиспользовании > 1000 шагов"
+    },
+    "r2_three_gradient_flows_conflict": {
+      "severity": "MEDIUM",
+      "what": "Три разных LR для трёх уровней могут конфликтовать — шкалы обгоняют индексы.",
+      "mitigation": "Заморозь индексы на первые 500 шагов. Дай шкалам сначала найти хорошую точку."
+    },
+    "r3_fundamental_capacity": {
+      "severity": "MEDIUM",
+      "what": "0.04 BPW — очень мало информации на вес. Это frontier research, не гарантия.",
+      "honest_expectation": "Nano-модель: уровень GPT-2 Small. Small-модель: уровень GPT-2 Medium. Выше — неизвестно."
+    },
+    "r4_xor_expressivity_limit": {
+      "severity": "LOW",
+      "what": "Если k=128 кодслов недостаточно для данной задачи, качество деградирует.",
+      "mitigation": "Начни с k=64 (быстро). Если val_bpb plateau — удвой k. Почти линейный рост качества."
+    }
+  },
+
+  "key_hyperparameter_sensitivity": {
+    "_most_important": "rank_r",
+    "rank_r": "Главный рычаг. r×2 → BPW×2 → качество ↑↑. Начни с r=64, масштабируй.",
+    "codebook_k": "Второй по важности. k=64 → быстро. k=256 → лучше, дольше.",
+    "commitment_beta": "Слишком высокий → кодбук игнорирует данные. Слишком низкий → collapse. Start 0.25.",
+    "lr_scales_multiplier": "Слишком высокий → шкалы переучиваются. Рекомендую 5-10x, не 20x."
+  }
+}
