@@ -1,0 +1,9 @@
+__pycache__/
+*.pt
+trilix_small_moe_logs/
+trilix_logs/
+train_small_moe_output.txt
+train_small_output.txt
+train_3min_output.txt
+*.zip
+github-auto-push.md

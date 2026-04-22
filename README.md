@@ -1,25 +1,9 @@
 # TRILIX-LFT: Triple-Level Indexed eXtreme Latent Factorized Transformer
 
-**Версия анализа:** 1.0 от 22.04.26  
-**Статус:** Анализ проекта — может содержать ошибки в выводах
-
----
-
-## ⚠️ ВАЖНОЕ ПРЕДУПРЕЖДЕНИЕ
-
-**Этот документ — результат анализа исходного кода. Выводы могут быть неполными или ошибочными.**  
-
-Реальное состояние проекта проверяй запуском:
-```bash
-python3 train_small_moe.py
-```
-
----
-
 <p align="center">
   <img src="https://img.shields.io/badge/BPW-0.0024-blue" alt="BPW">
   <img src="https://img.shields.io/badge/GPU-RTX%203090-green" alt="GPU">
-  <img src="https.shields.io/badge/PyTorch-2.0+-red" alt="PyTorch">
+  <img src="https://img.shields.io/badge/PyTorch-2.0+-red" alt="PyTorch">
   <img src="https://img.shields.io/badge/License-MIT-yellow" alt="License">
 </p>
 

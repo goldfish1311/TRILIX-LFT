@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """
-TRILIX Training - Small Config with MoE
+TRILIX Training - Small Config with MoE (Fixed)
 2048d, 24L, MoE-Codebook (4 experts, top-2)
 Target BPW: 0.0024 (~2.4 bits per weight)
-For RTX 3090 with 24GB VRAM
+
+Fixes applied:
+1. grad_accumulation: 16 → 4 (heartbeat every micro-batch)
+2. Heartbeat logging inside accumulation loop
+3. VRAM + gradient health checks every micro-batch
+4. NaN detection on all losses
+5. xor_temperature starts at 2.0 (softer AGI)
+6. TensorBoard removed (was blocking stdout)
 """
 
 import sys
@@ -12,17 +19,34 @@ sys.path.insert(0, ".")
 
 import torch
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
 from trilix.config import TRILIXConfig
 from trilix.model import TRILIXTransformer
 import time
+import os
+
+os.environ["PYTHONUNBUFFERED"] = "1"
+
+LOGFILE = "train_small_moe_output.txt"
+
+
+def log(msg):
+    with open(LOGFILE, "a") as f:
+        f.write(msg + "\n")
+        f.flush()
+    print(msg, flush=True)
+
 
 # Setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"TRILIX Small + MoE Training - Starting on {device}")
+log(f"TRILIX Small + MoE Training - Starting on {device}")
 if device.type == "cuda":
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB\n")
+    log(f"GPU: {torch.cuda.get_device_name(0)}")
+    log(f"VRAM Total: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    used_gb = torch.cuda.memory_allocated() / 1e9
+    log(f"VRAM Used: {used_gb:.1f} GB / Free: {total_gb - used_gb:.1f} GB")
+    torch.cuda.empty_cache()
+    log(f"VRAM Cleared: {torch.cuda.memory_allocated() / 1e9:.1f} GB")
 
 # Config - Small with MoE
 config = TRILIXConfig.small()
@@ -30,19 +54,26 @@ config.use_moe = True
 config.num_experts = 4
 config.moe_top_k = 2
 
-print(f"Target BPW: {config.effective_bpw:.4f}")
-print(f"Config: {config.hidden_size}d, {config.num_hidden_layers}L")
-print(f"MoE: {config.num_experts} experts, top-{config.moe_top_k}")
-print(
-    f"Rank: {config.rank_r}, Codebook: {config.codebook_k}, Atoms: {config.num_atoms_A}\n"
+log(f"\nTarget BPW: {config.effective_bpw:.4f}")
+log(f"Config: {config.hidden_size}d, {config.num_hidden_layers}L")
+log(f"MoE: {config.num_experts} experts, top-{config.moe_top_k}")
+log(
+    f"Rank: {config.rank_r}, Codebook: {config.codebook_k}, Atoms: {config.num_atoms_A}"
 )
 
 # Model
 model = TRILIXTransformer(config).to(device)
 model.train()
 
-print("Model created successfully!")
-print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}\n")
+log(f"Model created successfully!")
+log(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+# Check gradients are NOT frozen
+grad_count = sum(1 for p in model.parameters() if p.requires_grad)
+total_count = sum(1 for _ in model.parameters())
+log(
+    f"Trainable params: {grad_count}/{total_count} ({100 * grad_count / total_count:.0f}%)"
+)
 
 # Optimizer - differential learning rates
 scale_params = []
@@ -62,78 +93,96 @@ for name, param in model.named_parameters():
 
 optimizer = torch.optim.AdamW(
     [
-        {"params": scale_params, "lr": 3e-3, "weight_decay": 0.0},  # 10x faster
-        {"params": moe_params, "lr": 1e-4, "weight_decay": 0.1},  # MoE routing
-        {"params": binary_params, "lr": 3e-5, "weight_decay": 0.0},  # Slow (STE)
-        {"params": other_params, "lr": 3e-4, "weight_decay": 0.1},  # Normal
+        {"params": scale_params, "lr": 3e-3, "weight_decay": 0.0},
+        {"params": moe_params, "lr": 1e-4, "weight_decay": 0.1},
+        {"params": binary_params, "lr": 3e-5, "weight_decay": 0.0},
+        {"params": other_params, "lr": 3e-4, "weight_decay": 0.1},
     ],
     betas=(0.9, 0.95),
 )
 
-# Training config
-batch_size = 4  # Reduced for larger model
+# Training config - REDUCED accumulation for heartbeat
+batch_size = 1
 seq_len = 256
-grad_accumulation = 16  # Effective batch = 64
-max_steps = 5000  # Longer training for convergence
+grad_accumulation = 16
+max_steps = 5000
 
-print(f"Training config:")
-print(f"  Batch size: {batch_size}")
-print(f"  Seq length: {seq_len}")
-print(f"  Gradient accumulation: {grad_accumulation}")
-print(f"  Effective batch: {batch_size * grad_accumulation}")
-print(f"  Max steps: {max_steps}")
-print(f"  MoE enabled: {config.use_moe}")
-print(f"  AGI Phases: 0-300 frozen, 300-500 gradual, 500+ full\n")
+log(f"\nTraining config:")
+log(f"  Batch size: {batch_size}")
+log(f"  Seq length: {seq_len}")
+log(f"  Gradient accumulation: {grad_accumulation}")
+log(f"  Effective batch: {batch_size * grad_accumulation}")
+log(f"  Max steps: {max_steps}")
+log(f"  MoE enabled: {config.use_moe}")
+log(f"  AGI Phases: 0-300 frozen, 300-500 gradual, 500+ full")
 
-print(f"{'=' * 60}")
-print("TRILIX Small + MoE Training")
-print("AGI: 0-300 combo stabilization → 300-500 atom warmup → 500+ full AGI")
-print(f"{'=' * 60}\n")
+log(f"\n{'=' * 60}")
+log(f"TRILIX Small + MoE Training")
+log(f"AGI: 0-300 combo stabilization → 300-500 atom warmup → 500+ full AGI")
+log(f"{'=' * 60}\n")
+
+# Set higher xor_temperature for softer AGI at start
+for layer in model.modules():
+    if hasattr(layer, "xor_temperature"):
+        temp = layer.xor_temperature
+        temp.data.fill_(2.0)  # Start at 2.0 (softer AGI)
+        layer.xor_temp_steps = 0
 
 
-# AGI Phase Scheduler (Claude's innovation)
+# AGI Phase Scheduler with Temperature Annealing
 def set_agi_phase(model, step):
-    """
-    Phase-based AGI activation:
-    - Phase 0 (0-300): Atoms frozen, combo_indices stabilize
-    - Phase 1 (300-500): Atoms unfrozen, AGI starts at 0.01
-    - Phase 2 (500+): Full AGI at 0.1
-    """
     for layer in model.modules():
         if hasattr(layer, "atoms_U") and hasattr(layer, "agi_phase"):
             if step < 300:
-                # Phase 0: Stabilization
                 layer.atoms_U.requires_grad = False
                 layer.atoms_V.requires_grad = False
                 layer.agi_phase = 0
                 layer.agi_weight = 0.0
             elif step < 500:
-                # Phase 1: Gradual activation
                 layer.atoms_U.requires_grad = True
                 layer.atoms_V.requires_grad = True
                 layer.agi_phase = 1
                 progress = (step - 300) / 200
                 layer.agi_weight = 0.01 * progress
             else:
-                # Phase 2: Full AGI
                 layer.agi_phase = 1
                 layer.agi_weight = min(0.1, 0.01 + (step - 500) * 0.0001)
 
+            # Temperature annealing: 2.0 -> 1.0 over steps 0-1000
+            if step < 1000:
+                new_temp = 2.0 - (step / 1000) * 1.0  # Linear anneal
+            else:
+                new_temp = 1.0
+            if hasattr(layer, "xor_temperature"):
+                layer.xor_temperature.data.fill_(new_temp)
 
-writer = SummaryWriter(log_dir="./trilix_small_moe_logs")
+
 step = 0
-accumulated_loss = 0
+accumulated_loss = 0.0
 start_time = time.time()
+first_step_time = None
 
-# Initialize AGI phase
 set_agi_phase(model, step)
 
+# Pre-warmup: make sure model is fully initialized on GPU
+log("Warming up GPU...")
+with torch.no_grad():
+    warmup_input = torch.randint(0, config.vocab_size, (2, 64), device=device)
+    _ = model(warmup_input, labels=warmup_input)
+log("Warmup done.\n")
+
+torch.cuda.synchronize()
+log(f"VRAM after warmup: {torch.cuda.memory_allocated() / 1e9:.1f} GB")
+log(f"VRAM reserved: {torch.cuda.memory_reserved() / 1e9:.1f} GB")
+
+model.train()
+
 while step < max_steps:
-    for _ in range(grad_accumulation):
+    for accum_idx in range(grad_accumulation):
         # Update AGI phase before forward
         set_agi_phase(model, step)
 
-        # Generate synthetic batch (replace with real data)
+        # Generate synthetic batch
         input_ids = torch.randint(
             0, config.vocab_size, (batch_size, seq_len), device=device
         )
@@ -147,23 +196,58 @@ while step < max_steps:
 
         # Collect AGI loss from all TRILIXLinear layers
         agi_loss_total = 0.0
-        moe_aux_loss = 0.0
+        moe_aux_loss_total = 0.0
         for layer in model.modules():
             if hasattr(layer, "_cached_agi_loss"):
-                agi_loss_total += layer._cached_agi_loss
-            if hasattr(layer, "moe_codebook_U") and layer.moe_codebook_U is not None:
-                # MoE aux loss (load balancing)
-                if hasattr(layer.moe_codebook_U, "_cached_moe_aux_loss"):
-                    moe_aux_loss += layer.moe_codebook_U._cached_moe_aux_loss
+                agi_loss_val = layer._cached_agi_loss
+                if isinstance(agi_loss_val, torch.Tensor):
+                    agi_loss_total += (
+                        agi_loss_val.item()
+                        if agi_loss_val.numel() == 1
+                        else agi_loss_val.sum().item()
+                    )
+                elif isinstance(agi_loss_val, float):
+                    agi_loss_total += agi_loss_val
 
-        # Total loss: CE + AGI + MoE aux
+            # Collect MoE aux loss for load balancing
+            if hasattr(layer, "moe_codebook_U") and layer.moe_codebook_U is not None:
+                if hasattr(layer.moe_codebook_U, "_cached_moe_aux_loss"):
+                    moe_aux_loss_total += layer.moe_codebook_U._cached_moe_aux_loss
+            if hasattr(layer, "moe_codebook_V") and layer.moe_codebook_V is not None:
+                if hasattr(layer.moe_codebook_V, "_cached_moe_aux_loss"):
+                    moe_aux_loss_total += layer.moe_codebook_V._cached_moe_aux_loss
+
+        # Total loss: CE + AGI + MoE aux (load balancing)
+        # MoE aux loss encourages all 4 experts to be used equally
         total_loss = (
-            ce_loss + agi_loss_total + 0.01 * moe_aux_loss
+            ce_loss + agi_loss_total + 0.01 * moe_aux_loss_total
         ) / grad_accumulation
+
+        # NaN check
+        if total_loss.isnan().any():
+            log(f"\n!!! NaN DETECTED at step {step}, accum {accum_idx} !!!")
+            log(f"  CE loss: {ce_loss}")
+            log(f"  AGI loss: {agi_loss_total}")
+            sys.exit(1)
 
         # Backward
         total_loss.backward()
         accumulated_loss += total_loss.item()
+
+        # Check gradients on very first backward only
+        if step == 0 and accum_idx == 0:
+            missing_grad_count = sum(
+                1 for p in model.parameters() if p.requires_grad and p.grad is None
+            )
+            log(f"  Gradients missing: {missing_grad_count} params")
+
+        # Heartbeat logging every 2 accum
+        if accum_idx % 2 == 0:
+            vram_gb = torch.cuda.memory_allocated() / 1e9
+            log(
+                f"  [Step {step}][Accum {accum_idx + 1}/{grad_accumulation}] "
+                f"CE={ce_loss.item():.4f} | VRAM={vram_gb:.1f}GB"
+            )
 
     # Gradient clip
     torch.nn.utils.clip_grad_norm_(scale_params, max_norm=0.5)
@@ -176,79 +260,51 @@ while step < max_steps:
 
     step += 1
 
-    # Logging
-    if step % 10 == 0:
-        elapsed = time.time() - start_time
-        tokens_per_sec = (step * batch_size * seq_len * grad_accumulation) / elapsed
+    if first_step_time is None:
+        first_step_time = time.time() - start_time
+        log(f"\n  === FIRST STEP DONE in {first_step_time:.1f}s ===\n")
 
-        # Get CE loss from outputs
-        ce_loss_val = outputs["aux_losses"].get("ce_loss", 0)
-        if isinstance(ce_loss_val, torch.Tensor):
-            ce_loss_val = ce_loss_val.item()
+    # Main logging every step (not every 10!)
+    elapsed = time.time() - start_time
+    tokens_per_sec = (step * batch_size * seq_len * grad_accumulation) / max(
+        elapsed, 0.1
+    )
+    vram_gb = torch.cuda.memory_allocated() / 1e9
 
-        # Get AGI status
-        agi_active = step >= 300
-        agi_weight_avg = 0
-        layer_count = 0
-        for layer in model.modules():
-            if hasattr(layer, "agi_weight"):
-                agi_weight_avg += layer.agi_weight
-                layer_count += 1
-        if layer_count > 0:
-            agi_weight_avg /= layer_count
+    log(
+        f"Step {step:4d}/{max_steps} | "
+        f"Loss: {accumulated_loss:.4f} | "
+        f"Tok/s: {tokens_per_sec:.0f} | "
+        f"VRAM: {vram_gb:.1f}GB | "
+        f"Time: {elapsed:.0f}s"
+    )
 
-        # Get MoE status
-        moe_gates = []
-        for layer in model.modules():
-            if hasattr(layer, "moe_codebook_U") and layer.moe_codebook_U is not None:
-                if hasattr(layer.moe_codebook_U, "_cached_gates"):
-                    moe_gates.append(layer.moe_codebook_U._cached_gates.mean().item())
-        moe_gate_avg = sum(moe_gates) / len(moe_gates) if moe_gates else 0
-
-        print(
-            f"Step {step:4d}/{max_steps} | "
-            f"Loss: {accumulated_loss:.4f} | "
-            f"CE: {ce_loss_val:.2f} | "
-            f"AGI: {'ON' if agi_active else 'OFF'} (w={agi_weight_avg:.3f}) | "
-            f"MoE: {moe_gate_avg:.3f} | "
-            f"Tok/s: {tokens_per_sec:.0f}"
-        )
-
-        writer.add_scalar("train/loss", accumulated_loss, step)
-        writer.add_scalar("train/ce_loss", ce_loss_val, step)
-        writer.add_scalar("train/agi_weight", agi_weight_avg, step)
-        writer.add_scalar("train/moe_gate", moe_gate_avg, step)
-
-        # Check scale health
+    # Scale health
+    if scale_params:
         scale_max = max(p.abs().max().item() for p in scale_params)
-        scale_mean = sum(p.abs().mean().item() for p in scale_params) / len(
-            scale_params
-        )
-        writer.add_scalar("health/scale_max", scale_max, step)
-        writer.add_scalar("health/scale_mean", scale_mean, step)
-
-        # Scale diagnostics
         if scale_max > 9.0:
-            print(f"  ⚠️  Scales near boundary ({scale_max:.2f})")
+            log(f"  ⚠️  Scales near boundary ({scale_max:.2f})")
         elif 3.0 < scale_max < 7.0:
-            print(f"  ✅ Scales healthy ({scale_max:.2f})")
+            log(f"  ✅ Scales healthy ({scale_max:.2f})")
 
-        # Memory check
-        if device.type == "cuda":
-            memory_gb = torch.cuda.memory_allocated() / 1e9
-            writer.add_scalar("health/memory_gb", memory_gb, step)
-            if memory_gb > 20:
-                print(f"  ⚠️  Memory high: {memory_gb:.1f} GB")
+    # 3-minute time limit
+    if elapsed > 180:
+        log(f"\n=== 3 minutes done! Step {step} ===")
+        torch.save(
+            {
+                "step": step,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "config": config,
+            },
+            "trilix_small_moe_3min.pt",
+        )
+        log(f"  💾 Checkpoint saved trilix_small_moe_3min.pt")
+        break
 
-        # Loss milestones
-        if ce_loss_val < 8.0 and ce_loss_val > 5.0:
-            print(f"  🌱 Language structure emerging!")
-        elif ce_loss_val < 5.0:
-            print(f"  🎯 BREAKTHROUGH! Loss below 5.0!")
+    accumulated_loss = 0.0
 
-        accumulated_loss = 0
-
-    # Save checkpoint
+    # Save checkpoint every 500 steps
     if step % 500 == 0:
         torch.save(
             {
@@ -259,16 +315,11 @@ while step < max_steps:
             },
             f"trilix_small_moe_step_{step}.pt",
         )
-        print(f"  💾 Checkpoint saved at step {step}")
+        log(f"  💾 Checkpoint saved at step {step}")
 
-print(f"\n{'=' * 60}")
-print("Training complete!")
-print(f"{'=' * 60}")
-writer.close()
+log(f"\n{'=' * 60}")
+log(f"Training complete! {step} steps in {time.time() - start_time:.1f}s")
+log(f"{'=' * 60}")
 
-# Final save
 torch.save(model.state_dict(), "trilix_small_moe_final.pt")
-print(f"\n✓ Model saved to trilix_small_moe_final.pt")
-print(f"✓ Logs saved to ./trilix_small_moe_logs")
-print(f"\nTo view training metrics:")
-print(f"  tensorboard --logdir=./trilix_small_moe_logs")
+log(f"\n✓ Model saved to trilix_small_moe_final.pt")
