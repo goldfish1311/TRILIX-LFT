@@ -2584,3 +2584,113 @@ class ReflectiveErrorLoop(nn.Module):
                 else 0.0
             ),
         }
+
+
+
+# =============================================================================
+# E1-E4: Innovations from Claude (integrated at end of file)
+# =============================================================================
+
+class BinaryApproximateAttention(nn.Module):
+    """E1: BinAttn — бинарное sparse attention."""
+    
+    def __init__(self, hidden_size, num_heads, head_dim, top_k_precise=0.1):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads  
+        self.head_dim = head_dim
+        self.top_k_fraction = top_k_precise
+        
+    def forward(self, q, k, v, mask=None):
+        batch_size, num_heads, seq_len, head_dim = q.shape
+        # Бинарное приближение
+        q_bin = torch.sign(q).detach()
+        k_bin = torch.sign(k).detach()
+        approx_scores = torch.matmul(q_bin, k_bin.transpose(-2, -1)) / head_dim
+        # Top-K для точного вычисления
+        k_precise = max(1, int(seq_len * self.top_k_fraction))
+        topk_vals, topk_idx = torch.topk(approx_scores, k_precise, dim=-1)
+        # Собираем K, V для top-k
+        k_gathered = torch.gather(k, 2, topk_idx.unsqueeze(-1).expand(-1, -1, -1, head_dim))
+        v_gathered = torch.gather(v, 2, topk_idx.unsqueeze(-1).expand(-1, -1, -1, head_dim))
+        # Точные скоры
+        precise_scores = torch.matmul(q.unsqueeze(-2), k_gathered.transpose(-2, -1)).squeeze(-2) / math.sqrt(head_dim)
+        if mask is not None:
+            mask_gathered = torch.gather(mask.expand(-1, -1, seq_len, -1), -1, topk_idx)
+            precise_scores = precise_scores + mask_gathered
+        precise_probs = F.softmax(precise_scores, dim=-1)
+        attn_output = torch.matmul(precise_probs.unsqueeze(-2), v_gathered).squeeze(-2)
+        return attn_output
+
+
+class ShadowDistillationHead(nn.Module):
+    """E2: OKDSH — Shadow Head for Knowledge Distillation."""
+    
+    def __init__(self, hidden_size=256, vocab_size=32000, rank=64):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.vocab_size = vocab_size
+        self.rank = rank
+        self.shadow_proj = nn.Linear(hidden_size, rank, bias=False)
+        self.shadow_head = nn.Linear(rank, vocab_size, bias=False)
+        nn.init.normal_(self.shadow_proj.weight, std=0.02)
+        nn.init.normal_(self.shadow_head.weight, std=0.02)
+        
+    def forward(self, hidden_states):
+        projected = self.shadow_proj(hidden_states)
+        return self.shadow_head(projected)
+    
+    def distillation_loss(self, trilix_logits, shadow_logits, temperature=2.0):
+        trilix_soft = F.log_softmax(trilix_logits / temperature, dim=-1)
+        shadow_soft = F.softmax(shadow_logits.detach() / temperature, dim=-1)
+        return F.kl_div(
+            trilix_soft.view(-1, self.vocab_size),
+            shadow_soft.view(-1, self.vocab_size),
+            reduction='batchmean'
+        ) * (temperature ** 2)
+
+
+class AdaptiveRankSchedule:
+    """E3: ARL — Adaptive Rank per Layer."""
+    
+    def __init__(self, num_layers, base_rank=100, min_factor=0.5, max_factor=2.0):
+        self.num_layers = num_layers
+        self.base_rank = base_rank
+        self.rank_schedule = self._generate_schedule(min_factor, max_factor)
+        
+    def _generate_schedule(self, min_factor, max_factor):
+        ranks = []
+        for i in range(self.num_layers):
+            progress = i / (self.num_layers - 1) if self.num_layers > 1 else 0
+            parabola = 4 * progress * (1 - progress)
+            factor = min_factor + (max_factor - min_factor) * parabola
+            rank = int(self.base_rank * factor)
+            rank = max(8, (rank // 8) * 8)
+            ranks.append(rank)
+        return ranks
+    
+    def get_rank(self, layer_idx):
+        return self.rank_schedule[layer_idx]
+
+
+class ConfidenceWeightedLoss(nn.Module):
+    """E4: CWL — Confidence-Weighted Loss."""
+    
+    def __init__(self, confidence_temp=2.0, min_weight=0.1):
+        super().__init__()
+        self.confidence_temp = confidence_temp
+        self.min_weight = min_weight
+        
+    def forward(self, logits, labels):
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        probs = F.softmax(shift_logits.detach() / self.confidence_temp, dim=-1)
+        max_prob = probs.max(dim=-1).values
+        weights = (1.0 - max_prob).clamp(self.min_weight, 1.0)
+        weights = weights / weights.mean()
+        ce_per_token = F.cross_entropy(
+            shift_logits.view(-1, logits.size(-1)),
+            shift_labels.view(-1),
+            reduction='none'
+        ).view_as(shift_labels)
+        return (ce_per_token * weights).mean()
