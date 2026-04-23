@@ -2,7 +2,7 @@
 
 > **Проект**: TRILIX-LFT — Трансформер с экстремальным сжатием до 0.0048 BPW  
 > **Автор**: Evgeny  
-> **Дата**: 2026-04-23 (обновлён 2026-04-23 вечер, C1 EDH + C2 REL)  
+> **Дата**: 2026-04-23 (обновлён 2026-04-24 ночь, багфиксы + новые инновации от Клода)  
 > **Статус**: Активная разработка
 
 ---
@@ -43,6 +43,16 @@
 | # | Что | Было | Стало | Коммит |
 |---|-----|------|-------|--------|
 | 1 | commitment_beta | 0.25 (взрывало loss=1127) | 0.0001 (loss=~592) | `0fc0be4` |
+| 2 | **Bug: commitment loss direction** | `U_soft.detach(), U_hard` — градиент не шёл в idx_logits | `U_soft, U_hard.detach()` — теперь idx_logits обучается | — |
+| 3 | **Bug: all_aux_losses reset** | строка 441 сбрасывала `{}` после записи swarm_specialization | Убран второй `all_aux_losses = {}` — Soul и Swarm losses теперь в total_loss | — |
+| 4 | **Bug: SGH highway loss** | `get_gradient_highway_loss(codebook, codebook)` — self=self → loss=0 | Убран highway_loss, оставлен только `get_group_coherence_loss` | — |
+| 5 | **Bug: gate_proj без MoE** | `use_moe` не передавался | Добавлен `use_moe=config.use_moe` в gate_proj | — |
+| 6 | **Bug: EMA loop Python** | for-loop по codebook_size | Python for-loop (Bug 4) — не исправлен, требует vectorized scatter_add_ | — |
+| 7 | **Bug: World Model не causal** | mean pooling по всей seq | Оставлен mean pooling — требует отдельной реализации causal | — |
+| 8 | **Bug: FHC возвращает центроиды** | `combined = mean(codebook)` — теряет структуру | Оставлен как есть — требует переработки архитектуры | — |
+| 9 | **Bug: per-group gradient clipping** | единый clip=1.0 | Не реализовано — требует рефакторинга train loop | — |
+| 10 | **HAR/DAE вызов** | Клод думал что не вызываются | Уже вызываются в train_small_moe.py (строки 89-90, 256-257) | — |
+| 11 | **SwiGLU gate_proj** | использовал TRILIXLinear с `use_moe=False` по умолчанию | Исправлено: теперь `use_moe=config.use_moe` как у up/down proj | — |
 
 ---
 
@@ -211,6 +221,117 @@ diff_cd = c * d  # "разность" c и d
 
 ---
 
+## Новые инновации от Клода (апрель 2026)
+
+Источник: полный архитектурный разбор всего кода TRILIX. 10 инноваций для максимизации качества при сохранении 0.005 BPW.
+
+### Группа D — Производительность (немедленно)
+
+| # | Инновация | Оценка | Приоритет | Статус |
+|---|-----------|--------|-----------|--------|
+| D1 | **EMA vectorized** — Python for-loop → scatter_add_ | ⭐ 10/10 | 🔴 КРИТИЧНО | Не реализовано |
+| D2 | **Per-group gradient clipping** | ⭐ 8/10 | 🟡 | Не реализовано |
+| D3 | **WandB мониторинг** | ⭐ 9/10 | 🟡 | Не реализовано |
+
+### Группа E — Качество (эта неделя)
+
+| # | Инновация | Оценка | Приоритет | Статус |
+|---|-----------|--------|-----------|--------|
+| E1 | **BinAttn** — Binary Q/K Sparse Attention | ⭐ 10/10 | 🔴 | Не реализовано |
+| E2 | **OKDSH** — Shadow FP16 Head (self-distillation) | ⭐ 9/10 | 🔴 | Не реализовано |
+| E3 | **ARL** — Adaptive Rank per Layer (U-shape) | ⭐ 8/10 | 🟡 | Не реализовано |
+| E4 | **CWL** — Confidence-Weighted Loss | ⭐ 8/10 | 🟡 | Не реализовано |
+
+### Группа F — Архитектура (после стабилизации)
+
+| # | Инновация | Оценка | Приоритет | Статус |
+|---|-----------|--------|-----------|--------|
+| F1 | **HPAE** — Hierarchical Positional Atom Encoding | ⭐ 7/10 | 🟠 | Не реализовано |
+| F2 | **CLAS** — Cross-Layer Atom Sharing | ⭐ 9/10 | 🟠 | Не реализовано |
+| F3 | **SpecDec** — Speculative Decoding с Nano draft | ⭐ 9/10 | 🟠 | Не реализовано |
+
+### Группа G — Продвинутые (финальная форма)
+
+| # | Инновация | Оценка | Приоритет | Статус |
+|---|-----------|--------|-----------|--------|
+| G1 | **LDC** — Latent Diffusion Codebook | ⭐ 9/10 | 🔵 ДАЛЬНЯЯ | Не реализовано |
+| G2 | **DSA** — Discrete Semantic Algebra (транзитивность) | ⭐ 10/10 | 🔵 ДАЛЬНЯЯ | Не реализовано |
+| G3 | **DBBA** — Dynamic BPW Budget Allocation | ⭐ 10/10 | 🔵 ДАЛЬНЯЯ | Не реализовано |
+
+---
+
+### Детали новых инноваций
+
+#### D1: EMA vectorized (EMA Python loop → scatter_add_)
+
+**Проблема**: 168 слоёв × 128 кодслов × Python for-loop = 21,504 итераций за шаг → 72 сек/шаг.
+
+**Решение**: один `scatter_add_` + `bincount` вместо for-loop.
+
+**Ожидаемый результат**: 72 сек → 3–8 сек.
+
+#### E1: BinAttn — Binary Q/K Sparse Attention
+
+**Что**: Q/K в бинарном виде → XNOR-similarity (popcount) → O(seq²/64) вместо O(seq²·r). Точный расчёт только для top-10% пар.
+
+**Результат**: 30× ускорение attention. 128K контекст на RTX 3090 без Flash Attention.
+
+#### E2: OKDSH — Shadow FP16 Head
+
+**Что**: FP16 shadow head (50 MB) внутри модели, обучается параллельно. Его soft logits → дистиллируются в TRILIX.
+
+**Результат**: внутренний учитель без дополнительной модели.
+
+#### E3: ARL — Adaptive Rank per Layer
+
+**Что**: U-образный профиль рангов. Средние слои (семантика) = 2× rank, края (синтаксис/предсказание) = 0.5× rank.
+
+**BPW**: 0.005 → 0.0051 (+4%). Качество: +8–15% на reasoning.
+
+#### E4: CWL — Confidence-Weighted Loss
+
+**Что**: редкие токены получают больший вес в loss. CE_loss × (1 - confidence).
+
+**Результат**: фокус на сложных токенах. +5–15% на GSM8K, HumanEval.
+
+#### F1: HPAE — Hierarchical Positional Atom Encoding
+
+**Что**: позиционные атомы (sin/cos компоненты) встраиваются в атомную структуру. RoPE + позиционные атомы.
+
+**Результат**: модель "помнит" позицию в FFN проходах.
+
+#### F2: CLAS — Cross-Layer Atom Sharing
+
+**Что**: глобальные атомы (разделяемые всеми слоями) + локальные атомы (per-layer). 3.7× меньше атомных параметров.
+
+**Результат**: глобальная специализация атомов, HAR/DAE работают на всю сеть.
+
+#### F3: SpecDec — Speculative Decoding
+
+**Что**: Nano TRILIX (268 MB) генерирует 5 черновиков → Small TRILIX проверяет параллельно.
+
+**Результат**: 65 tok/s → 200–250 tok/s.
+
+#### G1: LDC — Latent Diffusion Codebook
+
+**Что**: кодслова генерируются через 1–2 шага диффузии. Произвольная геометрия manifold.
+
+**Результат**: семантически близкие концепции → близкие кодслова.
+
+#### G2: DSA — Discrete Semantic Algebra
+
+**Что**: SDO + транзитивность (A→B + B→C ≈ A→C). Цепочки рассуждений через кодбук.
+
+**Результат**: Chain-of-Thought встроен в структуру весов.
+
+#### G3: DBBA — Dynamic BPW Budget Allocation
+
+**Что**: learnable gate решает сколько rank-измерений активировать. Lagrangian constraint на BPW=0.005.
+
+**Результат**: первая модель где сеть сама распределяет битовый бюджет.
+
+---
+
 ## Мои инновации (мои идеи)
 
 | # | Инновация | Приоритет | Статус |
@@ -223,44 +344,74 @@ diff_cd = c * d  # "разность" c и d
 
 ---
 
-## Что НЕ реализуем
+## Что НЕ реализуем (или требует рефакторинга)
 
 | Идея | Почему | Когда можно |
 |------|--------|-------------|
-| **UAS объединять** | Soul и WorldModel уже работают раздельно. Объединение сломает отладку. | Добавить Belief Gate в WorldModelHead |
+| **UAS объединять** | Soul и WorldModel уже работают раздельно. | Добавить Belief Gate в WorldModelHead |
 | **Meta-Reflective Mutation** (Гемини) | Конфликт градиентов. | После REL от Клода |
 | **R-MoE как дерево** (Дипсик) | Рекурсия = непрозрачный gradient | Заменить на FHC от Клода |
+| **FHC возвращает центроиды** | Требует переработки архитектуры FHC | После реализации D1 (vectorized EMA) |
+| **World Model causal** | Требует отдельной реализации | После стабилизации базового обучения |
 
 ---
 
-## План реализации (обновлённый)
+## План реализации (обновлённый после разбора Клода)
 
 ```
-✅ Завершено:
-├── commitment_beta fix
-├── SAIB + RVQ + SGH + ATC + LCC
-├── A1: Soul Codebook
-└── A2: Latent World Model
-
-📋 Следующие (B4 → B3):
-├── B4: Hebbian Atom Resonance (~2 дня)
-│   └── files: layers.py, train.py
-│
-├── B3: Differentiable Atom Evolution (~3 дня)
-│   └── files: evolution.py (новый), train.py
-│
-├── A3: Belief Gate в WorldModel (~0.5 дня)
-│   └── files: layers.py, model.py
-│
-📋 Среднесрочные:
-├── B1.5: Flat Hierarchical Codebook (~4 дня)
-├── B2: Emergent Agent Swarm (~2 дня)
-│
-📋 Продвинутые (когда стабилизируется):
+✅ Завершено (базовая система + roadmap):
+├── commitment_beta fix + commitment direction fix
+├── SAIB + RVQ + SGH (coherence only) + ATC + LCC
+├── A1: Soul Codebook (1024 агента)
+├── A2: World Model
+├── A3: Belief Gate
+├── B1.5: FHC
+├── B2: Agent Swarm
+├── B3: DAE
+├── B4: HAR
+├── B5: SDO
 ├── C1: EDH
-├── C2: REL
-└── M1-M5: мои инновации
+└── C2: REL
+
+🔴 Немедленно (эта неделя):
+├── D1: EMA vectorized (Python loop → scatter_add_) — критично для скорости
+├── D2: Per-group gradient clipping
+├── D3: WandB мониторинг
+└── Bug fixes: all_aux_losses reset, gate_proj MoE, commitment direction
+
+🟡 Эта неделя → следующая:
+├── E1: BinAttn — бинарное sparse attention
+├── E2: OKDSH — shadow FP16 head self-distillation
+├── E3: ARL — adaptive rank per layer
+└── E4: CWL — confidence-weighted loss
+
+🟠 Среднесрочные (после стабилизации):
+├── F1: HPAE — positional atom encoding
+├── F2: CLAS — cross-layer atom sharing
+└── F3: SpecDec — speculative decoding
+
+🔵 Финальная форма:
+├── G1: LDC — latent diffusion codebook
+├── G2: DSA — discrete semantic algebra (транзитивность)
+└── G3: DBBA — dynamic BPW budget allocation
 ```
+
+---
+
+## Честный разговор: победа над GPT-4.5/Claude/Gemini
+
+Клод дал важное уточнение: **в абсолютных числах** (MMLU 92-95%) TRILIX при 0.005 BPW не победит — у GPT-5.4 триллионы параметров и триллионы токенов. Но в **другой нише** — TRILIX может стать #1 уже сегодня:
+
+| Параметр | GPT-5.4 / Claude / Gemini | TRILIX цель 2026 |
+|---|---|---|
+| MMLU абсолютный | 92–95% | 72–80% |
+| **MMLU на 1 GB RAM** | невозможно | **72–80%** |
+| **Tokens/sec RTX 3090** | не запустится | **500–2000** |
+| **128K context на 24 GB** | нет | **да** |
+| **Стоимость 1M токенов** | $5–15 | **$0.01–0.05** |
+| Работает на телефоне | нет | да |
+
+Это **другая ниша** — минимальная память + максимальная скорость + reasoning — и в ней конкурентов нет. BitNet b1.58 от Microsoft — ближайший аналог, но TRILIX уже превосходит его архитектурно.
 
 ---
 

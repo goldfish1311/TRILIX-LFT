@@ -1080,17 +1080,15 @@ class TRILIXLinear(nn.Module):
             # Use SAIB EMA instead of manual EMA
             self.saib_U.ema_update(U_soft, idx_U_hard_idx)
 
-        # Commitment loss: encourage soft to stay close to hard
-        commitment_loss = self.commitment_beta * F.mse_loss(U_soft.detach(), U_hard)
+        # Commitment loss: encourage soft (encoder output) to stay close to hard (codebook)
+        # Gradient flows to U_soft, NOT to U_hard (codebook stays fixed)
+        commitment_loss = self.commitment_beta * F.mse_loss(U_soft, U_hard.detach())
 
-        # SGH: Semantic Gradient Highway - gradient consistency loss
+        # SGH: Semantic Gradient Highway — coherence loss only (highway loss requires gradients, not available in forward)
         sgh_loss = 0.0
         if self.use_sgh and self.sgh_U is not None:
-            # Highway: similar codebook entries → similar gradients
-            highway_loss = self.sgh_U.get_gradient_highway_loss(codebook_U, codebook_U)
-            # Coherence: entries cluster by semantic similarity
             coherence_loss = self.sgh_U.get_group_coherence_loss(codebook_U)
-            sgh_loss = highway_loss + coherence_loss
+            sgh_loss = coherence_loss
             self._cached_sgh_loss = sgh_loss
 
         # LCC loss: encourage diverse codebook generation
@@ -1142,7 +1140,7 @@ class TRILIXLinear(nn.Module):
         if self.use_saib and self.saib_V is not None:
             self.saib_V.ema_update(V_soft, idx_V_hard_idx)
 
-        commitment_loss = self.commitment_beta * F.mse_loss(V_soft.detach(), V_hard)
+        commitment_loss = self.commitment_beta * F.mse_loss(V_soft, V_hard.detach())
 
         with torch.no_grad():
             self.usage_counter_V.index_add_(
@@ -1159,17 +1157,13 @@ class TRILIXLinear(nn.Module):
 
         V_final = STEIndex.apply(V_soft, V_hard)
 
-        # SGH: Semantic Gradient Highway for V
+        # SGH: Semantic Gradient Highway for V — coherence only
         if self.use_sgh and self.sgh_V is not None:
-            highway_loss_v = self.sgh_V.get_gradient_highway_loss(
-                codebook_V, codebook_V
-            )
             coherence_loss_v = self.sgh_V.get_group_coherence_loss(codebook_V)
-            sgh_loss_v = highway_loss_v + coherence_loss_v
             self._cached_sgh_loss = (
-                self._cached_sgh_loss + sgh_loss_v
+                self._cached_sgh_loss + coherence_loss_v
                 if hasattr(self, "_cached_sgh_loss")
-                else sgh_loss_v
+                else coherence_loss_v
             )
 
         # LCC loss for V

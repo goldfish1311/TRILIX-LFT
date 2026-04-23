@@ -213,6 +213,9 @@ class TRILIXSwiGLU(nn.Module):
             xor_arity=config.xor_arity_b,
             commitment_beta=config.commitment_beta,
             atom_ema_decay=config.atom_ema_decay,
+            use_moe=config.use_moe,
+            num_experts=config.num_experts if config.use_moe else 4,
+            moe_top_k=config.moe_top_k if config.use_moe else 2,
         )
 
         self.up_proj = TRILIXLinear(
@@ -438,7 +441,6 @@ class TRILIXTransformer(nn.Module):
             attention_mask = (1.0 - attention_mask) * -10000.0
 
         # Transformer layers
-        all_aux_losses = {}
         present_key_values = [] if past_key_values is None else past_key_values
 
         for i, layer in enumerate(self.layers):
