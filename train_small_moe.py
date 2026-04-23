@@ -80,6 +80,7 @@ log(
 scale_params = []
 binary_params = []
 moe_params = []
+world_model_params = []
 other_params = []
 
 for name, param in model.named_parameters():
@@ -87,6 +88,8 @@ for name, param in model.named_parameters():
         scale_params.append(param)
     elif "moe" in name or "expert" in name or "router" in name:
         moe_params.append(param)
+    elif "world_model" in name:
+        world_model_params.append(param)
     elif "atoms" in name or "idx_" in name or "combo_" in name:
         binary_params.append(param)
     else:
@@ -96,6 +99,7 @@ optimizer = torch.optim.AdamW(
     [
         {"params": scale_params, "lr": 3e-3, "weight_decay": 0.0},
         {"params": moe_params, "lr": 1e-4, "weight_decay": 0.1},
+        {"params": world_model_params, "lr": 3e-4, "weight_decay": 0.1},
         {"params": binary_params, "lr": 3e-5, "weight_decay": 0.0},
         {"params": other_params, "lr": 3e-4, "weight_decay": 0.1},
     ],
@@ -138,6 +142,7 @@ step = 0
 accumulated_loss = 0.0
 start_time = time.time()
 first_step_time = None
+world_model_loss_val = 0.0  # A2: World Model loss
 
 set_agi_phase(model, step)
 
@@ -173,6 +178,7 @@ while step < max_steps:
         # Collect AGI loss from all TRILIXLinear layers
         agi_loss_total = 0.0
         moe_aux_loss_total = 0.0
+        world_model_loss_val = 0.0
         for layer in model.modules():
             if hasattr(layer, "_cached_agi_loss"):
                 agi_loss_val = layer._cached_agi_loss
@@ -193,7 +199,15 @@ while step < max_steps:
                 if hasattr(layer.moe_codebook_V, "_cached_moe_aux_loss"):
                     moe_aux_loss_total += layer.moe_codebook_V._cached_moe_aux_loss
 
-        # Total loss: CE + AGI + MoE aux (load balancing)
+        # A2: World Model loss из aux_losses
+        if outputs.get("aux_losses") and "world_model_loss" in outputs["aux_losses"]:
+            world_model_loss_val = (
+                outputs["aux_losses"]["world_model_loss"].item()
+                if isinstance(outputs["aux_losses"]["world_model_loss"], torch.Tensor)
+                else outputs["aux_losses"]["world_model_loss"]
+            )
+
+        # Total loss: CE + AGI + MoE aux (load balancing) + World Model
         # MoE aux loss encourages all 4 experts to be used equally
         total_loss = (
             ce_loss + agi_loss_total + 0.01 * moe_aux_loss_total
@@ -255,7 +269,8 @@ while step < max_steps:
         f"Loss: {accumulated_loss:.4f} | "
         f"Tok/s: {tokens_per_sec:.0f} | "
         f"VRAM: {vram_gb:.1f}GB | "
-        f"Time: {elapsed:.0f}s"
+        f"Time: {elapsed:.0f}s | "
+        f"WorldModel: {world_model_loss_val:.4f}"
     )
 
     # Scale health

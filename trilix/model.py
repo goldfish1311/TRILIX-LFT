@@ -9,7 +9,7 @@ import torch.nn.functional as F
 import math
 from typing import Optional, Tuple, Dict
 
-from .layers import TRILIXLinear
+from .layers import TRILIXLinear, WorldModelHead
 from .config import TRILIXConfig
 
 
@@ -316,6 +316,13 @@ class TRILIXTransformer(nn.Module):
         # LM head (kept in BF16 - not compressed)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+        # A2: World Model head для предсказания следующего латентного состояния
+        # Проецируем hidden_size -> rank_r для предсказания z_next
+        self.world_model_head = WorldModelHead(
+            r=config.rank_r, hidden_dim=config.rank_r * 2
+        )
+        self.z_projector = nn.Linear(config.hidden_size, config.rank_r)
+
         # Initialize
         self._init_weights()
 
@@ -387,6 +394,23 @@ class TRILIXTransformer(nn.Module):
                 shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1)
             )
 
+        # A2: World Model loss — предсказание следующего латентного состояния
+        # Среднее по sequence для каждого элемента батча
+        z = hidden_states.mean(dim=1)  # [batch, hidden_size]
+        z_proj = self.z_projector(z)  # [batch, rank]
+
+        # z_next — следующий токен (среднее по sequence на 1 шаг вперёд)
+        z_next = hidden_states[:, 1:, :].mean(dim=1)  # [batch, hidden_size]
+        z_next_proj = self.z_projector(z_next)  # [batch, rank]
+
+        # Предсказание
+        z_pred = self.world_model_head(z_proj)  # [batch, rank]
+
+        # World Model loss — MSE между предсказанным и реальным следующим состоянием
+        world_model_loss = F.mse_loss(
+            z_pred, z_next_proj.detach()
+        )  # detach чтобы не мешать CE
+
         # Auxiliary losses
         aux_loss_sum = sum(all_aux_losses.values())
 
@@ -397,11 +421,15 @@ class TRILIXTransformer(nn.Module):
             for i in range(self.config.num_hidden_layers)
         )
 
+        # A2: World Model loss в сумму aux losses (с весом 0.1 чтобы не доминировать)
+        aux_loss_sum = aux_loss_sum + 0.1 * world_model_loss
+
         total_loss = ce_loss + aux_loss_sum
 
         all_aux_losses["ce_loss"] = ce_loss
         all_aux_losses["total_aux"] = aux_loss_sum
         all_aux_losses["diversity_total"] = diversity_loss
+        all_aux_losses["world_model_loss"] = world_model_loss
 
         return {
             "logits": logits,

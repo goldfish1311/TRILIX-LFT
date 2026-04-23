@@ -1266,3 +1266,43 @@ class LearnedCodebookCompressor(nn.Module):
     def get_codebook(self) -> torch.Tensor:
         """Get current codebook."""
         return self.forward()
+
+
+class WorldModelHead(nn.Module):
+    """A2: Latent World Model — учит латентное пространство предсказывать будущее.
+
+    Обучает r-мерное пространство не просто сжимать данные,
+    а предсказывать собственное будущее состояние.
+
+    Это создаёт внутри сети "модель мира" — внутреннюю симуляцию,
+    которая понимает причинно-следственные связи.
+
+    Args:
+        r: Latent dimension (должен совпадать с rank TRILIX)
+        hidden_dim: Размер скрытого слоя предсказателя
+    """
+
+    def __init__(self, r: int = 100, hidden_dim: int = 128):
+        super().__init__()
+        self.r = r
+        self.hidden_dim = hidden_dim
+
+        # Предсказатель: z -> z_next
+        self.predictor = nn.Sequential(
+            nn.Linear(r, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, r),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """Предсказать следующее латентное состояние.
+
+        Args:
+            z: [batch, r] — латентное состояние текущего токена
+
+        Returns:
+            z_pred: [batch, r] — предсказанное состояние следующего токена
+        """
+        return self.predictor(z)

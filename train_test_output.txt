@@ -1,0 +1,35 @@
+TRILIX Small + MoE Training - Starting on cuda
+GPU: NVIDIA GeForce RTX 3090
+VRAM Total: 25.3 GB
+VRAM Used: 0.0 GB / Free: 25.3 GB
+VRAM Cleared: 0.0 GB
+
+Target BPW: 0.0024
+Config: 2048d, 24L
+MoE: 4 experts, top-2
+Rank: 100, Codebook: 128, Atoms: 32
+Model created successfully!
+Parameters: 282,323,872
+Trainable params: 5643/5643 (100%)
+
+Training config:
+  Batch size: 1
+  Seq length: 256
+  Gradient accumulation: 16
+  Effective batch: 16
+  Max steps: 5000
+  MoE enabled: True
+  AGI Phases: 0-300 frozen, 300-500 gradual, 500+ full
+
+============================================================
+TRILIX Small + MoE Training
+AGI: 0-300 combo stabilization → 300-500 atom warmup → 500+ full AGI
+============================================================
+
+Warming up GPU...
+Warmup done.
+
+VRAM after warmup: 1.2 GB
+VRAM reserved: 1.2 GB
+  Gradients missing: 3744 params
+  [Step 0][Accum 1/16] CE=592.6669 | VRAM=2.3GB
