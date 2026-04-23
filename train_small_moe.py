@@ -274,7 +274,7 @@ while step < max_steps:
         f"Tok/s: {tokens_per_sec:.0f} | "
         f"VRAM: {vram_gb:.1f}GB | "
         f"Time: {elapsed:.0f}s | "
-        f"WorldModel: {world_model_loss_val:.4f}"
+        f"WM: {world_model_loss_val:.4f}"
     )
 
     # Scale health

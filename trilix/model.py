@@ -9,7 +9,13 @@ import torch.nn.functional as F
 import math
 from typing import Optional, Tuple, Dict
 
-from .layers import TRILIXLinear, WorldModelHead, SoulCodebook
+from .layers import (
+    TRILIXLinear,
+    WorldModelHead,
+    SoulCodebook,
+    SymbolicDiffLoss,
+    STEBinary,
+)
 from .config import TRILIXConfig
 
 
@@ -328,6 +334,9 @@ class TRILIXTransformer(nn.Module):
         self.soul_codebook = SoulCodebook(num_agents=1024, r=config.rank_r)
         self.soul_projector = nn.Linear(config.rank_r, config.hidden_size)
 
+        # B5: SDO — Symbolic Diff Operations для reasoning
+        self.symbolic_diff_loss = SymbolicDiffLoss(rank=config.rank_r)
+
         # Initialize
         self._init_weights()
 
@@ -444,12 +453,42 @@ class TRILIXTransformer(nn.Module):
         # A2: World Model loss в сумму aux losses (с весом 0.1 чтобы не доминировать)
         aux_loss_sum = aux_loss_sum + 0.1 * world_model_loss
 
+        # B5: SDO — Symbolic Diff Operations для reasoning
+        # Семплируем codebook из первого слоя
+        codebook_U_sdo = None
+        codebook_V_sdo = None
+        for layer in self.layers:
+            if codebook_U_sdo is None:
+                trilix_layer = layer.self_attn.q_proj
+                if hasattr(trilix_layer, "_get_combo_indices_hard"):
+                    atoms_U_bin = STEBinary.apply(trilix_layer.atoms_U)
+                    atoms_V_bin = STEBinary.apply(trilix_layer.atoms_V)
+                    combo_idx_U = trilix_layer._get_combo_indices_hard(
+                        trilix_layer.combo_indices_U_logits
+                    )
+                    combo_idx_V = trilix_layer._get_combo_indices_hard(
+                        trilix_layer.combo_indices_V_logits
+                    )
+                    codebook_U_sdo = trilix_layer._decode_codebook_entry(
+                        trilix_layer.combo_weights_U, combo_idx_U, atoms_U_bin
+                    )
+                    codebook_V_sdo = trilix_layer._decode_codebook_entry(
+                        trilix_layer.combo_weights_V, combo_idx_V, atoms_V_bin
+                    )
+                break
+
+        sdo_loss = torch.tensor(0.0, device=hidden_states.device)
+        if codebook_U_sdo is not None:
+            sdo_loss = self.symbolic_diff_loss(codebook_U_sdo, codebook_V_sdo)
+            aux_loss_sum = aux_loss_sum + sdo_loss
+
         total_loss = ce_loss + aux_loss_sum
 
         all_aux_losses["ce_loss"] = ce_loss
         all_aux_losses["total_aux"] = aux_loss_sum
         all_aux_losses["diversity_total"] = diversity_loss
         all_aux_losses["world_model_loss"] = world_model_loss
+        all_aux_losses["sdo_loss"] = sdo_loss
 
         return {
             "logits": logits,

@@ -1268,6 +1268,95 @@ class LearnedCodebookCompressor(nn.Module):
         return self.forward()
 
 
+class SymbolicDiffLoss(nn.Module):
+    """B5: SDO — Symbolic Diff Operations (от Клода).
+
+    Аналогия word2vec king-man+woman=queen, но через XOR в пространстве кодбука.
+
+    Если C[a] XOR C[b] ≈ C[c] XOR C[d]
+    → модель умеет делать структурные аналогии через дискретные операции
+    → это напрямую улучшает reasoning capabilities
+
+    Ключевой инсайт Клода:
+    - {±1} XOR = поэлементное умножение (，不需要特殊处理)
+    - Это нативная битовая операция в кремнии
+    - Ближе к логическому мышлению человека
+
+    Два компонента:
+    1. analogy_clarity: поощряет высокий |similarity| (чёткие аналогии, не размытые)
+    2. analogy_diversity: поощряет разнообразие (не коллапс к одной аналогии)
+
+    Args:
+        rank: Latent dimension (r)
+        num_samples: Сколько аналогий семплировать за раз (default: 32)
+        loss_weight: Вес лосса (default: 0.0001)
+    """
+
+    def __init__(
+        self, rank: int = 100, num_samples: int = 32, loss_weight: float = 0.0001
+    ):
+        super().__init__()
+        self.rank = rank
+        self.num_samples = num_samples
+        self.loss_weight = loss_weight
+
+    def _binary_xor(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """XOR двух бинарных векторов {±1} = поэлементное умножение."""
+        return a * b
+
+    def forward(
+        self,
+        codebook_U: torch.Tensor,
+        codebook_V: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            codebook_U: [k, r] — кодбук для U матрицы
+            codebook_V: [k, r] — кодбук для V матрицы
+
+        Returns:
+            sdo_loss: scalar — штраф за отсутствие аналогий
+        """
+        k, r = codebook_U.shape
+        if k < 4:
+            return torch.tensor(0.0, device=codebook_U.device)
+
+        loss_u = self._symbolic_analogy_loss(codebook_U)
+        loss_v = self._symbolic_analogy_loss(codebook_V)
+        return (loss_u + loss_v) * self.loss_weight
+
+    def _symbolic_analogy_loss(self, codebook: torch.Tensor) -> torch.Tensor:
+        """Поощряем структурные аналогии в codebook."""
+        k, r = codebook.shape
+
+        # Семплировать случайные квадреты индексов (a, b, c, d)
+        indices = torch.randint(0, k, (self.num_samples, 4), device=codebook.device)
+
+        a = codebook[indices[:, 0]]
+        b = codebook[indices[:, 1]]
+        c = codebook[indices[:, 2]]
+        d = codebook[indices[:, 3]]
+
+        # XOR в пространстве {±1} = поэлементное умножение
+        diff_ab = self._binary_xor(a, b)
+        diff_cd = self._binary_xor(c, d)
+
+        # Если diff_ab близок к diff_cd → есть аналогия
+        # Cosine similarity: диапазон [-1, 1]
+        # similarity = 1 → полная аналогия (diff_ab == diff_cd)
+        # similarity = 0 → нет аналогии
+        similarity = (diff_ab * diff_cd).sum(dim=-1) / r
+
+        # 1. Analogy clarity: поощряем чёткие аналогии (высокий |similarity|)
+        analogy_clarity = -similarity.abs().mean()
+
+        # 2. Analogy diversity: поощряем разнообразие (низкая variance)
+        # Если все similarity одинаковые → коллапс к одной аналогии
+        analogy_diversity = similarity.var()
+
+        return analogy_clarity + 0.1 * (1 - analogy_diversity)
+
+
 class SoulCodebook(nn.Module):
     """A1: Soul Codebook — файл "души" агента.
 
