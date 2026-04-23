@@ -1268,6 +1268,47 @@ class LearnedCodebookCompressor(nn.Module):
         return self.forward()
 
 
+class SoulCodebook(nn.Module):
+    """A1: Soul Codebook — файл "души" агента.
+
+    Один обучаемый вектор, который подключается к латентному пространству.
+    Один TRILIX становится 1000+ разными агентами.
+
+    Меняя soul_id, модель "переключает личность":
+    - soul_id=0: Python-разработчик
+    - soul_id=1: Поэт
+    - soul_id=2: Математик
+    - и т.д.
+
+    Soul-вектор добавляется к латентному представлению ДО роутера MoE,
+    физически перестраивая синапсы под агента.
+
+    Args:
+        num_agents: Количество агентов (по умолчанию 1024)
+        r: Latent dimension (должен совпадать с rank TRILIX)
+    """
+
+    def __init__(self, num_agents: int = 1024, r: int = 100):
+        super().__init__()
+        self.num_agents = num_agents
+        self.r = r
+        self.soul_vectors = nn.Embedding(num_agents, r)
+
+        # Инициализация — случайные "характеры"
+        nn.init.normal_(self.soul_vectors.weight, std=0.02)
+
+    def forward(self, soul_id: torch.Tensor) -> torch.Tensor:
+        """Получить вектор души для агента.
+
+        Args:
+            soul_id: [batch] — ID агента (0..num_agents-1)
+
+        Returns:
+            soul: [batch, r] — вектор "души" агента
+        """
+        return self.soul_vectors(soul_id)
+
+
 class WorldModelHead(nn.Module):
     """A2: Latent World Model — учит латентное пространство предсказывать будущее.
 

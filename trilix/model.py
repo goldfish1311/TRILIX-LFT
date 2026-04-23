@@ -9,7 +9,7 @@ import torch.nn.functional as F
 import math
 from typing import Optional, Tuple, Dict
 
-from .layers import TRILIXLinear, WorldModelHead
+from .layers import TRILIXLinear, WorldModelHead, SoulCodebook
 from .config import TRILIXConfig
 
 
@@ -323,6 +323,11 @@ class TRILIXTransformer(nn.Module):
         )
         self.z_projector = nn.Linear(config.hidden_size, config.rank_r)
 
+        # A1: Soul Codebook — файл "души" агента
+        # Один TRILIX = 1024 разных агента (переключение за 1 токен)
+        self.soul_codebook = SoulCodebook(num_agents=1024, r=config.rank_r)
+        self.soul_projector = nn.Linear(config.rank_r, config.hidden_size)
+
         # Initialize
         self._init_weights()
 
@@ -338,9 +343,13 @@ class TRILIXTransformer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[list] = None,
         labels: Optional[torch.Tensor] = None,
+        soul_id: Optional[torch.Tensor] = None,
     ) -> Dict:
         """
         Forward pass
+
+        Args:
+            soul_id: [batch] — ID агента (0..1023). Если None — случайный.
 
         Returns dict with:
         - logits: [batch, seq_len, vocab_size]
@@ -351,6 +360,17 @@ class TRILIXTransformer(nn.Module):
 
         # Embeddings
         hidden_states = self.embed_tokens(input_ids)
+
+        # A1: Soul Codebook — добавляем "душу" агента к латентному пространству
+        # Если soul_id не передан — случайный агент
+        if soul_id is None:
+            soul_id = torch.randint(
+                0, self.soul_codebook.num_agents, (batch_size,), device=input_ids.device
+            )
+        soul_vector = self.soul_codebook(soul_id)  # [batch, rank]
+        soul_vector = self.soul_projector(soul_vector)  # [batch, hidden_size]
+        # Добавляем soul к hidden_states (broadcast по seq_len)
+        hidden_states = hidden_states + soul_vector.unsqueeze(1) * 0.1
 
         # Prepare attention mask
         if attention_mask is not None:

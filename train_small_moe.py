@@ -81,6 +81,7 @@ scale_params = []
 binary_params = []
 moe_params = []
 world_model_params = []
+soul_params = []
 other_params = []
 
 for name, param in model.named_parameters():
@@ -88,8 +89,10 @@ for name, param in model.named_parameters():
         scale_params.append(param)
     elif "moe" in name or "expert" in name or "router" in name:
         moe_params.append(param)
-    elif "world_model" in name:
+    elif "world_model" in name or "z_projector" in name or "soul_projector" in name:
         world_model_params.append(param)
+    elif "soul_codebook" in name:
+        soul_params.append(param)
     elif "atoms" in name or "idx_" in name or "combo_" in name:
         binary_params.append(param)
     else:
@@ -100,6 +103,7 @@ optimizer = torch.optim.AdamW(
         {"params": scale_params, "lr": 3e-3, "weight_decay": 0.0},
         {"params": moe_params, "lr": 1e-4, "weight_decay": 0.1},
         {"params": world_model_params, "lr": 3e-4, "weight_decay": 0.1},
+        {"params": soul_params, "lr": 1e-4, "weight_decay": 0.01},
         {"params": binary_params, "lr": 3e-5, "weight_decay": 0.0},
         {"params": other_params, "lr": 3e-4, "weight_decay": 0.1},
     ],
