@@ -22,7 +22,8 @@
 | A2 | **Latent World Model** — предсказание следующего состояния | ✅ Работает | `bc4006b` |
 | B5 | **SDO** — Symbolic Diff Operations | ✅ Работает | `5421917` |
 | B4 | **HAR** — Hebbian Atom Resonance | ✅ Работает | `d7459fc` |
-| B3 | **DAE** — Differentiable Atom Evolution | ✅ Работает | — |
+| B3 | **DAE** — Differentiable Atom Evolution | ✅ Работает | `9985cda` |
+| B1.5 | **FHC** — Flat Hierarchical Codebook | ✅ Работает | — |
 
 ### Новые цели (документы)
 
@@ -165,14 +166,17 @@ diff_cd = c * d  # "разность" c и d
 
 #### B1.5: Flat Hierarchical Codebook (FHC)
 **Источник**: Клод (улучшение R-MoE Дипсика)  
-**Статус**: 📋 Запланировано
+**Статус**: ✅ ЗАВЕРШЕНО — 2026-04-23
 
-**Суть**: Плоская матрица маршрутизации вместо рекурсивного дерева.
-- 4 мета-эксперта × 4 базовых = 16 виртуальных специализаций
-- Один matmul, clear gradient flow
-- Память: `[4×4]` матрица
+**Суть**: 4 мета-эксперта × 4 базовых = 16 виртуальных специализаций. Один matmul, clear gradient flow.
 
-**Почему лучше чем R-MoE Дипсика:** дерево = непрозрачный gradient flow. FHC = один forward, легко профилировать.
+**vs R-MoE Дипсика:** дерево = непрозрачный gradient flow. FHC = один forward, легко профилировать.
+
+**Архитектура:**
+- Meta-experts (4): "стратегии" маршрутизации
+- Base experts (4): "базовые паттерны"
+- Meta affinity (learned): [meta_k × base_k] — какой meta любит какой base
+- Virtual expert = meta[b] ⊙ base[a] (element-wise, не matmul)
 
 ---
 

@@ -55,9 +55,15 @@ config.use_moe = True
 config.num_experts = 4
 config.moe_top_k = 2
 
+# B1.5: Enable Flat Hierarchical Codebook (4 meta × 4 base = 16 virtual experts)
+config.use_fhc = True
+
 log(f"\nTarget BPW: {config.effective_bpw:.4f}")
 log(f"Config: {config.hidden_size}d, {config.num_hidden_layers}L")
-log(f"MoE: {config.num_experts} experts, top-{config.moe_top_k}")
+if config.use_fhc:
+    log(f"FHC: 4×4=16 виртуальных экспертов (Flat Hierarchical Codebook)")
+else:
+    log(f"MoE: {config.num_experts} experts, top-{config.moe_top_k}")
 log(
     f"Rank: {config.rank_r}, Codebook: {config.codebook_k}, Atoms: {config.num_atoms_A}"
 )

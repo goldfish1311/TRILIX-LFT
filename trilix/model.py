@@ -52,6 +52,7 @@ def get_trilix_kwargs(config: TRILIXConfig) -> Dict:
         "use_rvq": config.use_rvq,
         "use_sgh": config.use_sgh,
         "use_lcc": config.use_lcc,
+        "use_fhc": config.use_fhc,
     }
 
 

@@ -35,6 +35,7 @@ class TRILIXConfig:
     use_rvq: bool = False  # Residual Vector Quantization
     use_sgh: bool = False  # Stochastic Group Hierarchy
     use_lcc: bool = False  # Learned Codebook Compressor
+    use_fhc: bool = False  # B1.5: Flat Hierarchical Codebook (4×4=16 virtual experts)
 
     # Scaling factors
     scale_lr_multiplier: float = 10.0

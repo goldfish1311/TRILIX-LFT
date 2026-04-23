@@ -10,6 +10,7 @@ from .layers import (
     TRILIXLinear,
     HebbianAtomResonance,
     DifferentiableAtomEvolver,
+    FlatHierarchicalMoE,
     TemperatureCascadeScheduler,
 )
 from .model import TRILIXTransformer
@@ -19,6 +20,7 @@ __all__ = [
     "TRILIXLinear",
     "HebbianAtomResonance",
     "DifferentiableAtomEvolver",
+    "FlatHierarchicalMoE",
     "TemperatureCascadeScheduler",
     "TRILIXTransformer",
 ]

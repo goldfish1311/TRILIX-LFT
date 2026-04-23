@@ -72,6 +72,120 @@ class CodebookExpert(nn.Module):
         return weighted.sum(dim=1)  # [k, r] - soft codewords
 
 
+class FlatHierarchicalMoE(nn.Module):
+    """
+    B1.5: Flat Hierarchical Codebook (FHC)
+
+    4 мета-эксперта × 4 базовых = 16 виртуальных специализаций.
+    Один matmul — clear gradient flow. НЕ рекурсивное дерево.
+
+    vs R-MoE Дипсика: дерево = непрозрачный gradient flow.
+    FHC = один forward, легко профилировать.
+
+    Router: [r] → [meta_k × base_k] = 4×4 = 16-way soft routing
+
+    Каждый виртуальный эксперт = мета[b] ⊙ базовый[a]
+    (element-wise product, NOT matmul)
+
+    Args:
+        meta_k: Number of meta-experts (default: 4)
+        base_k: Number of base experts (default: 4)
+        k: Codebook size per expert
+        r: Latent dimension
+        top_k: Number of virtual experts to activate per token
+    """
+
+    def __init__(
+        self,
+        meta_k: int = 4,
+        base_k: int = 4,
+        k: int = 64,
+        r: int = 64,
+        top_k: int = 2,
+        num_atoms: int = 16,
+        xor_arity: int = 3,
+    ):
+        super().__init__()
+        self.meta_k = meta_k
+        self.base_k = base_k
+        self.virtual_k = meta_k * base_k
+        self.k = k
+        self.r = r
+        self.top_k = top_k
+
+        # Meta-experts: [meta_k, r] — "стратегии" маршрутизации
+        self.meta_experts = nn.ModuleList(
+            [
+                CodebookExpert(k=k, r=r, num_atoms=num_atoms, xor_arity=xor_arity)
+                for _ in range(meta_k)
+            ]
+        )
+
+        # Base experts: [base_k, r] — "базовые паттерны"
+        self.base_experts = nn.ModuleList(
+            [
+                CodebookExpert(k=k, r=r, num_atoms=num_atoms, xor_arity=xor_arity)
+                for _ in range(base_k)
+            ]
+        )
+
+        # Router: flat 1D routing over virtual experts
+        # [r] → [meta_k * base_k] — one matmul, clean gradient
+        self.router = nn.Linear(r, self.virtual_k, bias=False)
+
+        # Meta affinity: how much each meta expert "likes" each base
+        # [meta_k, base_k] — learned, not fixed
+        self.meta_affinity = nn.Parameter(torch.ones(meta_k, base_k) * 0.5)
+
+    def forward(
+        self, x_latent: torch.Tensor, temperature: float = 1.0
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, r = x_latent.shape
+
+        # Get meta and base expert codebooks (centroids)
+        meta_codebooks = [e.get_codewords(temperature) for e in self.meta_experts]
+        base_codebooks = [e.get_codewords(temperature) for e in self.base_experts]
+        # Each: [k, r]
+
+        meta_centroids = torch.stack([cb.mean(dim=0) for cb in meta_codebooks], dim=0)
+        base_centroids = torch.stack([cb.mean(dim=0) for cb in base_codebooks], dim=0)
+
+        meta_centroids = F.normalize(meta_centroids, dim=1)
+        base_centroids = F.normalize(base_centroids, dim=1)
+
+        affinity = torch.sigmoid(self.meta_affinity)
+        virtual_centroids = torch.einsum(
+            "mr,br,mr->mb", meta_centroids, base_centroids, affinity
+        )
+        virtual_centroids = F.normalize(virtual_centroids, dim=1)
+
+        virtual_centroids_flat = virtual_centroids.reshape(-1, r)
+
+        router_logits = self.router(x_latent)
+        temp = max(temperature, 0.1)
+        router_probs = F.softmax(router_logits / temp, dim=-1)
+        gates, top_ids = torch.topk(router_probs, self.top_k, dim=-1)
+        gates = gates / gates.sum(dim=-1, keepdim=True)
+
+        selected = virtual_centroids_flat[top_ids]
+        combined = (gates.unsqueeze(-1) * selected).sum(dim=1)
+
+        router_prob = F.softmax(router_logits, dim=-1)
+        aux_loss = (
+            self.virtual_k
+            * (router_prob.mean(dim=[0, 1]) * router_prob.mean(dim=[0, 1])).sum()
+        )
+
+        self._cached_virt_k = self.virtual_k
+        self._cached_meta_k = self.meta_k
+        self._cached_base_k = self.base_k
+        self._cached_gates = gates
+        self._cached_top_ids = top_ids
+        self._cached_aux_loss = aux_loss
+
+        return combined, aux_loss
+
+
 class MoECodebook(nn.Module):
     """
     Mixture of Experts for Codebook generation.
@@ -91,80 +205,40 @@ class MoECodebook(nn.Module):
         self.r = r
         self.top_k = top_k
 
-        # Create experts
         self.experts = nn.ModuleList(
             [
                 CodebookExpert(k=k, r=r, num_atoms=16, xor_arity=3)
                 for _ in range(num_experts)
             ]
         )
-
-        # Router: projects from latent space to expert selection
         self.router = nn.Linear(r, num_experts, bias=False)
 
     def forward(
         self, x_latent: torch.Tensor, temperature: float = 1.0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x_latent: [batch, seq, r] - latent representations after V^T·x
-            temperature: For gating softmax
-
-        Returns:
-            codebook_output: [batch, seq, r] - weighted expert outputs
-            aux_loss: Load balancing loss for training
-        """
         batch_size, seq_len, r = x_latent.shape
-
-        # Token-level routing
-        # router_logits: [batch, seq, num_experts]
         router_logits = self.router(x_latent)
-
-        # Top-k gating
         gates, expert_ids = torch.topk(
             F.softmax(router_logits / max(temperature, 0.1), dim=-1), self.top_k, dim=-1
-        )  # gates: [B, S, top_k], expert_ids: [B, S, top_k]
-
-        # Normalize gates
-        gates = gates / gates.sum(dim=-1, keepdim=True)  # [B, S, top_k]
-
-        # Gather outputs from experts
-        # For efficiency, we compute all expert codebooks once per layer
-        expert_codebooks = []
-        for expert in self.experts:
-            expert_codebooks.append(expert.get_codewords(temperature))  # List of [k, r]
-
-        # For now: return routing info and let TRILIXLinear handle lookup
-        # We'll store expert outputs for the layer to use
+        )
+        gates = gates / gates.sum(dim=-1, keepdim=True)
+        expert_codebooks = [e.get_codewords(temperature) for e in self.experts]
         self._cached_expert_codebooks = expert_codebooks
         self._cached_gates = gates
         self._cached_expert_ids = expert_ids
-
-        # Compute load balancing loss (encourage uniform expert usage)
-        router_prob = F.softmax(router_logits, dim=-1)  # [B, S, E]
+        router_prob = F.softmax(router_logits, dim=-1)
         aux_loss = (
             self.num_experts
-            * (
-                router_prob.mean(dim=[0, 1])
-                * (router_prob > 0).float().mean(dim=[0, 1])
-            ).sum()
+            * (router_prob.mean(dim=[0, 1]) * router_prob.mean(dim=[0, 1])).sum()
         )
-
-        # Return weighted combination of expert centroids
-        # For simplicity: average of expert codebooks weighted by gate
         combined = torch.zeros(batch_size, seq_len, r, device=x_latent.device)
         for i in range(self.num_experts):
-            # Check where this expert is in top-k
-            expert_mask = (expert_ids == i).any(dim=-1).float()  # [B, S]
             expert_gate = (
                 gates[..., 0] * (expert_ids[..., 0] == i).float()
                 + gates[..., 1] * (expert_ids[..., 1] == i).float()
-            )  # [B, S]
-
-            # Add contribution (using centroid of expert codebook)
-            expert_centroid = expert_codebooks[i].mean(dim=0)  # [r]
+            )
+            expert_centroid = expert_codebooks[i].mean(dim=0)
             combined += expert_gate.unsqueeze(-1) * expert_centroid
-
         return combined, aux_loss
 
 
@@ -177,7 +251,6 @@ class STEBinary(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        # Clipped STE: only pass gradient if |x| <= 1
         return grad_output
 
 
@@ -620,6 +693,7 @@ class TRILIXLinear(nn.Module):
         use_rvq: bool = False,
         use_sgh: bool = False,
         use_lcc: bool = False,
+        use_fhc: bool = False,
     ):
         super().__init__()
 
@@ -641,6 +715,7 @@ class TRILIXLinear(nn.Module):
         self.use_har = False
         self.dae = None
         self.use_dae = False
+        self.use_fhc = use_fhc
 
         # Temperature for soft XOR (anneals from 1.0 to 0.01)
         # ATC: 3 independent temperatures for cascade freezing
@@ -661,14 +736,34 @@ class TRILIXLinear(nn.Module):
         self.latent_scale = nn.Parameter(torch.ones(rank))  # l
 
         # Level 4: MoE-Codebook (optional)
+        # B1.5: FlatHierarchicalMoE or standard MoECodebook
         if self.use_moe:
-            self.moe_codebook_U = MoECodebook(
-                num_experts=num_experts, k=codebook_size, r=rank, top_k=moe_top_k
-            )
-            self.moe_codebook_V = MoECodebook(
-                num_experts=num_experts, k=codebook_size, r=rank, top_k=moe_top_k
-            )
-            # Router aux loss weight
+            if self.use_fhc:
+                self.moe_codebook_U = FlatHierarchicalMoE(
+                    meta_k=4,
+                    base_k=4,
+                    k=codebook_size,
+                    r=rank,
+                    top_k=moe_top_k,
+                    num_atoms=num_atoms,
+                    xor_arity=xor_arity,
+                )
+                self.moe_codebook_V = FlatHierarchicalMoE(
+                    meta_k=4,
+                    base_k=4,
+                    k=codebook_size,
+                    r=rank,
+                    top_k=moe_top_k,
+                    num_atoms=num_atoms,
+                    xor_arity=xor_arity,
+                )
+            else:
+                self.moe_codebook_U = MoECodebook(
+                    num_experts=num_experts, k=codebook_size, r=rank, top_k=moe_top_k
+                )
+                self.moe_codebook_V = MoECodebook(
+                    num_experts=num_experts, k=codebook_size, r=rank, top_k=moe_top_k
+                )
             self.moe_aux_weight = 0.01
         else:
             self.moe_codebook_U = None
