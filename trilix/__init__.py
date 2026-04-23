@@ -16,6 +16,11 @@ from .layers import (
     ErrorDrivenHypernetwork,
     ReflectiveErrorLoop,
     TemperatureCascadeScheduler,
+    # E1-E4: Innovations from Claude
+    BinaryApproximateAttention,
+    ShadowDistillationHead,
+    AdaptiveRankSchedule,
+    ConfidenceWeightedLoss,
 )
 from .model import TRILIXTransformer
 
@@ -31,4 +36,9 @@ __all__ = [
     "ReflectiveErrorLoop",
     "TemperatureCascadeScheduler",
     "TRILIXTransformer",
+    # E1-E4
+    "BinaryApproximateAttention",
+    "ShadowDistillationHead",
+    "AdaptiveRankSchedule",
+    "ConfidenceWeightedLoss",
 ]
