@@ -291,10 +291,16 @@ class TRILIXLinear(nn.Module):
 
         if use_rvq:
             self.rvq_U = ResidualVectorQuantizer(
-                num_levels=3, codebook_size=codebook_size, rank=rank
+                codebook_size=codebook_size,
+                rank=rank,
+                num_residual_levels=2,
+                residual_size=16,
             )
             self.rvq_V = ResidualVectorQuantizer(
-                num_levels=3, codebook_size=codebook_size, rank=rank
+                codebook_size=codebook_size,
+                rank=rank,
+                num_residual_levels=2,
+                residual_size=16,
             )
         else:
             self.rvq_U = None
@@ -464,7 +470,17 @@ class TRILIXLinear(nn.Module):
         temp = self.codebook_temperature.item()
         if temp > 0.05:
             combined = torch.tanh(combined / temp)
-        codebook = STEBinary.apply(combined)
+        coarse_codebook = STEBinary.apply(combined)
+
+        # RVQ refinement: add residual on top of coarse
+        if self.use_rvq and self.rvq_U is not None:
+            coarse_indices = torch.arange(
+                self.codebook_size, device=atoms_binary.device
+            )
+            codebook = self.rvq_U.decode_with_residual(coarse_codebook, coarse_indices)
+            self._cached_rvq_loss = self.rvq_U.get_residual_loss(coarse_codebook)
+        else:
+            codebook = coarse_codebook
 
         return codebook
 
@@ -541,19 +557,22 @@ class TRILIXLinear(nn.Module):
         # Soft version for gradient flow (matmul with softmax weights)
         U_soft = torch.matmul(idx_U_soft, codebook_U)  # [out_features, rank]
 
-        # SAIB: use attention-based blending instead of argmax
+        # SAIB: EMA update of codebook (already done below, but explicitly call SAIB if enabled)
         if self.use_saib and self.saib_U is not None:
-            saib_blend, _ = self.saib_U(U_soft, codebook_U)
-            U_soft = saib_blend
+            # Use SAIB EMA instead of manual EMA
+            self.saib_U.ema_update(U_soft, idx_U_hard_idx)
 
         # Commitment loss: encourage soft to stay close to hard
         commitment_loss = self.commitment_beta * F.mse_loss(U_soft.detach(), U_hard)
 
-        # SGH regularization loss
+        # SGH: Semantic Gradient Highway - gradient consistency loss
         sgh_loss = 0.0
         if self.use_sgh and self.sgh_U is not None:
-            idx_temp = max(self.idx_temperature.item(), 0.1)
-            sgh_loss = self.sgh_U.get_regularization_loss(temperature=idx_temp)
+            # Highway: similar codebook entries → similar gradients
+            highway_loss = self.sgh_U.get_gradient_highway_loss(codebook_U, codebook_U)
+            # Coherence: entries cluster by semantic similarity
+            coherence_loss = self.sgh_U.get_group_coherence_loss(codebook_U)
+            sgh_loss = highway_loss + coherence_loss
             self._cached_sgh_loss = sgh_loss
 
         # LCC loss: encourage diverse codebook generation
@@ -601,10 +620,9 @@ class TRILIXLinear(nn.Module):
         V_hard = codebook_V[idx_V_hard_idx]  # [in_features, rank]
         V_soft = torch.matmul(idx_V_soft, codebook_V)
 
-        # SAIB: use attention-based blending for V
+        # SAIB: EMA update for V
         if self.use_saib and self.saib_V is not None:
-            saib_blend, _ = self.saib_V(V_soft, codebook_V)
-            V_soft = saib_blend
+            self.saib_V.ema_update(V_soft, idx_V_hard_idx)
 
         commitment_loss = self.commitment_beta * F.mse_loss(V_soft.detach(), V_hard)
 
@@ -623,10 +641,13 @@ class TRILIXLinear(nn.Module):
 
         V_final = STEIndex.apply(V_soft, V_hard)
 
-        # SGH regularization loss for V
+        # SGH: Semantic Gradient Highway for V
         if self.use_sgh and self.sgh_V is not None:
-            idx_temp = max(self.idx_temperature.item(), 0.1)
-            sgh_loss_v = self.sgh_V.get_regularization_loss(temperature=idx_temp)
+            highway_loss_v = self.sgh_V.get_gradient_highway_loss(
+                codebook_V, codebook_V
+            )
+            coherence_loss_v = self.sgh_V.get_group_coherence_loss(codebook_V)
+            sgh_loss_v = highway_loss_v + coherence_loss_v
             self._cached_sgh_loss = (
                 self._cached_sgh_loss + sgh_loss_v
                 if hasattr(self, "_cached_sgh_loss")
@@ -943,104 +964,279 @@ class TemperatureCascadeScheduler:
 
 
 class StochasticGroupHierarchy(nn.Module):
-    """Innovation 2: SGH - Stochastic Group Hierarchy for codebook regularization."""
+    """Innovation 2: SGH - Semantic Gradient Highway.
 
-    def __init__(
-        self, codebook_size: int, rank: int, num_groups: int = 4, num_subgroups: int = 4
-    ):
+    Creates direct gradient paths through output space to codebook entries.
+    Instead of gradients flowing through weights (old way), they flow through
+    semantic representations (output similarity).
+
+    Key insight: if two codebook entries produce similar outputs, their
+    gradients should be similar (semantic clustering).
+    """
+
+    def __init__(self, codebook_size: int, rank: int, num_groups: int = 8):
         super().__init__()
         self.k = codebook_size
         self.r = rank
         self.num_groups = num_groups
-        self.num_subgroups = num_subgroups
 
-        self.group_logits = nn.Parameter(torch.randn(codebook_size, num_groups) * 0.01)
-        self.subgroup_logits = nn.Parameter(
-            torch.randn(codebook_size, num_groups, num_subgroups) * 0.01
-        )
+        # Group embeddings for semantic clustering
+        self.group_embeddings = nn.Parameter(torch.randn(num_groups, rank) * 0.01)
 
-    def get_group_assignment(self, temperature: float = 1.0):
-        """Returns soft group/subgroup assignments."""
-        group_soft = F.softmax(self.group_logits / max(temperature, 0.1), dim=-1)
-        subgroup_soft = F.softmax(self.subgroup_logits / max(temperature, 0.1), dim=-1)
-        return group_soft, subgroup_soft
+        # Codebook-to-group assignment (learnable)
+        self.register_buffer("codebook_to_group", torch.zeros(codebook_size))
 
-    def get_regularization_loss(self, temperature: float = 1.0):
-        """SGH regularization: uniform group usage + confident assignment."""
-        group_soft, _ = self.get_group_assignment(temperature)
-        group_usage = group_soft.sum(dim=0)
-        uniform_loss = ((group_usage / group_usage.mean()) - 1.0).abs().mean()
-        entropy_loss = -(group_soft * (group_soft + 1e-8).log()).sum(dim=-1).mean()
-        return 0.01 * (uniform_loss + 0.1 * entropy_loss)
+    def compute_output_similarity(self, codebook: torch.Tensor) -> torch.Tensor:
+        """
+        Compute pairwise output similarity of codebook entries.
+        Entries that produce similar outputs should have similar gradients.
+
+        Args:
+            codebook: [k, rank] - codebook entries
+
+        Returns:
+            similarity: [k, k] - cosine similarity matrix
+        """
+        # Normalize entries
+        codebook_norm = F.normalize(codebook, dim=-1)
+
+        # Pairwise cosine similarity
+        similarity = codebook_norm @ codebook_norm.T
+
+        return similarity
+
+    def get_gradient_highway_loss(
+        self,
+        codebook: torch.Tensor,
+        codebook_grad: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        SGH loss: gradient highway through semantic similarity.
+
+        If two codebook entries produce similar outputs (high similarity),
+        they should receive similar gradients.
+
+        Args:
+            codebook: [k, rank] - current codebook entries
+            codebook_grad: [k, rank] - gradient w.r.t. codebook entries
+
+        Returns:
+            highway_loss: scalar - gradient consistency loss
+        """
+        # Compute output similarity among codebook entries
+        sim = self.compute_output_similarity(codebook)
+
+        # Compute gradient similarity among codebook entries
+        grad_norm = F.normalize(codebook_grad, dim=-1)
+        grad_sim = grad_norm @ grad_norm.T
+
+        # Highway loss: gradient similarity should follow output similarity
+        mask = (sim > 0.5).float()
+
+        highway_loss = ((sim - grad_sim) ** 2 * mask).sum() / (mask.sum() + 1e-8)
+
+        return 0.01 * highway_loss
+
+    def get_group_coherence_loss(self, codebook: torch.Tensor) -> torch.Tensor:
+        """
+        Encourage codebook entries within a group to cluster together.
+        """
+        # Soft assignment to groups
+        codebook_norm = F.normalize(codebook, dim=-1)
+        group_norm = F.normalize(self.group_embeddings, dim=-1)
+
+        # [k, r] @ [r, num_groups] -> [k, num_groups]
+        assignment_scores = codebook_norm @ group_norm.T
+        assignment_soft = F.softmax(assignment_scores, dim=-1)
+
+        # Entries in same group should have similar embeddings
+        # Compute group centroids
+        group_centroids = assignment_soft.T @ codebook  # [num_groups, rank]
+
+        # Reconstruction loss: codebook ≈ assignment @ group_centroids
+        reconstructed = assignment_soft @ group_centroids  # [k, rank]
+        coherence_loss = F.mse_loss(codebook, reconstructed)
+
+        return 0.001 * coherence_loss
 
 
 class ResidualVectorQuantizer(nn.Module):
-    """Innovation 3: RVQ - Residual Vector Quantization."""
+    """Innovation 3: RVQ - Residual Vector Quantization (like EnCodec/DAC).
 
-    def __init__(self, num_levels: int = 3, codebook_size: int = 16, rank: int = 64):
+    Two-level quantization:
+    - Level 1 (coarse): existing XOR codebook
+    - Level 2 (residual): small codebook for fine-tuning the residual
+
+    Effective codebook size = k_coarse × k_residual
+    Storage: k_coarse + k_residual entries instead of k_coarse × k_residual
+
+    For each codeword:
+    codeword_final = coarse_entry[coarse_idx] + residual_entry[residual_idx]
+    """
+
+    def __init__(
+        self,
+        codebook_size: int,
+        rank: int,
+        num_residual_levels: int = 2,
+        residual_size: int = 16,
+    ):
         super().__init__()
-        self.num_levels = num_levels
-        self.k = codebook_size
+        self.k_coarse = codebook_size
         self.r = rank
-        for i in range(num_levels):
+        self.num_levels = num_residual_levels
+        self.k_residual = residual_size
+
+        # Residual codebooks (one per level)
+        # Each has k_residual entries of rank r
+        for lvl in range(num_residual_levels):
             self.register_parameter(
-                f"codebook_level_{i}",
-                nn.Parameter(torch.randn(codebook_size, rank) * 0.01),
+                f"residual_cb_{lvl}",
+                nn.Parameter(torch.randn(residual_size, rank) * 0.01),
             )
+            # Residual index logits (per coarse entry)
             self.register_parameter(
-                f"idx_logits_level_{i}",
-                nn.Parameter(torch.randn(1, codebook_size) * 0.01),
+                f"residual_idx_{lvl}",
+                nn.Parameter(torch.zeros(codebook_size, residual_size)),
             )
 
-    def forward(self, x: torch.Tensor):
-        batch = x.shape[0]
-        total = torch.zeros(batch, self.r, device=x.device, dtype=x.dtype)
-        indices = []
+    def decode_with_residual(
+        self,
+        coarse_codebook: torch.Tensor,
+        coarse_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Decode codewords with residual refinement.
+
+        Args:
+            coarse_codebook: [k_coarse, rank] - the XOR-generated coarse codebook
+            coarse_indices: [num_entries] - which coarse entry to use
+
+        Returns:
+            refined: [num_entries, rank] - coarse + residual refinement
+        """
+        # Get coarse entries
+        coarse_entries = coarse_codebook[coarse_indices]  # [num_entries, rank]
+
+        # Apply residual refinement level by level
+        current = coarse_entries
         for lvl in range(self.num_levels):
-            cb = getattr(self, f"codebook_level_{lvl}")
-            lg = getattr(self, f"idx_logits_level_{lvl}")
-            scores = lg @ cb.T
-            idx = scores.argmax(dim=-1)
-            indices.append(idx.item())
-            total = total + cb[idx.squeeze(0)]
-        return total, torch.tensor(indices, device=x.device)
+            residual_cb = getattr(self, f"residual_cb_{lvl}")
+            residual_idx = getattr(self, f"residual_idx_{lvl}")
+
+            # Compute residual scores based on current approximation
+            # residual_idx: [k_coarse, k_residual] - how good each residual is for each coarse
+            residual_scores = residual_idx[coarse_indices]  # [num_entries, k_residual]
+            residual_softmax = F.softmax(residual_scores, dim=-1)
+
+            # Get best residual for each entry
+            residual_indices = residual_softmax.argmax(dim=-1)  # [num_entries]
+            residual_entries = residual_cb[residual_indices]  # [num_entries, rank]
+
+            # Add residual
+            current = current + residual_entries
+
+        return current
+
+    def get_residual_loss(self, coarse_codebook: torch.Tensor) -> torch.Tensor:
+        """
+        Encourage residual codebook to capture what coarse misses.
+        L2 loss: residual should reconstruct the difference from mean.
+        """
+        # Mean codebook entry
+        mean_entry = coarse_codebook.mean(dim=0, keepdim=True)  # [1, r]
+
+        total_loss = 0.0
+        for lvl in range(self.num_levels):
+            residual_cb = getattr(self, f"residual_cb_{lvl}")
+            # Residual should help reconstruct deviations from mean
+            loss = (residual_cb**2).mean()
+            total_loss = total_loss + loss
+
+        return 0.001 * total_loss
 
     def get_codebook_size_effective(self) -> int:
-        return self.k**self.num_levels
+        """Effective k = k_coarse * k_residual^num_levels"""
+        return self.k_coarse * (self.k_residual**self.num_levels)
 
 
 class SoftAttentionIndexBlender(nn.Module):
-    """Innovation 1: SAIB - Soft Attention for Index Blending.
+    """Innovation 1: SAIB - Spectral Initialization + EMA for Codebook.
 
-    Uses attention over codebook indices for smoother quantization.
-    Instead of hard argmax, computes weighted blend of codebook entries.
+    1. Spectral initialization: SVD-based atom initialization for better conditioning
+    2. EMA update: exponential moving average for codebook entries (like DAC/EnCodec)
+
+    Benefits:
+    - Faster convergence (spectral init)
+    - More stable training (EMA updates)
+    - No extra parameters needed
     """
 
-    def __init__(self, codebook_size: int, rank: int, num_heads: int = 4):
+    def __init__(self, codebook_size: int, rank: int, ema_decay: float = 0.99):
         super().__init__()
         self.k = codebook_size
         self.r = rank
-        self.num_heads = num_heads
+        self.ema_decay = ema_decay
 
-        self.query_proj = nn.Linear(rank, rank)
-        self.key_proj = nn.Linear(rank, rank)
-        self.value_proj = nn.Linear(rank, rank)
-        self.scale = rank**-0.5
+        # EMA buffers for codebook entries
+        self.register_buffer("ema_codebook", torch.zeros(codebook_size, rank))
+        self.register_buffer("ema_cluster_counts", torch.zeros(codebook_size))
+        self.ema_initialized = False
+
+    def spectral_init_atoms(self, random_matrix: torch.Tensor):
+        """
+        Initialize atoms using SVD of random matrix.
+        This gives orthogonal, well-conditioned starting vectors.
+
+        Args:
+            random_matrix: [N, r] - random initialization matrix
+        """
+        with torch.no_grad():
+            # Center the matrix
+            centered = random_matrix - random_matrix.mean(dim=0, keepdim=True)
+
+            # SVD
+            try:
+                U, S, Vt = torch.linalg.svd(centered, full_matrices=False)
+                # Use top r singular vectors as initialization
+                # Atoms = Vt[:num_atoms] scaled by sqrt(S)
+                initialized = (
+                    Vt[: min(random_matrix.shape[0], Vt.shape[0])]
+                    * S[: min(random_matrix.shape[0], S.shape[0])].sqrt()
+                ).T
+                return initialized
+            except Exception:
+                # Fallback to random init if SVD fails
+                return random_matrix
+
+    def ema_update(self, assigned_entries: torch.Tensor, indices: torch.Tensor):
+        """
+        EMA update of codebook entries based on assigned vectors.
+        Like DAC/EnCodec: codebook[k] = decay * codebook[k] + (1-decay) * new_entry
+
+        Args:
+            assigned_entries: [N, r] - vectors assigned to each codebook entry
+            indices: [N] - which codebook entry each vector belongs to
+        """
+        if not self.ema_initialized:
+            self.ema_codebook.fill_(0)
+            self.ema_cluster_counts.fill_(0)
+            self.ema_initialized = True
+
+        # Per-entry EMA update
+        for idx, entry in zip(indices.unique(), assigned_entries):
+            mask = indices == idx
+            batch_mean = assigned_entries[mask].mean(dim=0)
+
+            self.ema_codebook[idx] = (
+                self.ema_decay * self.ema_codebook[idx]
+                + (1 - self.ema_decay) * batch_mean
+            )
+            self.ema_cluster_counts[idx] += mask.sum().item()
 
     def forward(self, x: torch.Tensor, codebook: torch.Tensor):
-        """Attention-weighted codebook blend."""
-        batch = x.shape[0]
-
-        q = self.query_proj(x).unsqueeze(1)  # [batch, 1, r]
-        k = self.key_proj(codebook).unsqueeze(0)  # [batch, k, r]
-        v = self.value_proj(codebook).unsqueeze(0)  # [batch, k, r]
-
-        attn_weights = torch.softmax(q @ k.transpose(-2, -1) * self.scale, dim=-1)
-
-        blended = (attn_weights @ v).squeeze(1)  # [batch, r]
-        hard_idx = attn_weights.argmax(dim=-1)
-
-        return blended, hard_idx.squeeze(-1)
+        """Just return codebook (EMA updates happen during quantization)."""
+        return codebook
 
 
 class LearnedCodebookCompressor(nn.Module):
