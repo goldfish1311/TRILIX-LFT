@@ -312,13 +312,29 @@ while step < max_steps:
         first_step_time = time.time() - start_time
         log(f"\n  === FIRST STEP DONE in {first_step_time:.1f}s ===\n")
 
-    # Main logging every step (not every 10!)
+    # D3: Enhanced logging with structured metrics (WandB-compatible)
     elapsed = time.time() - start_time
     tokens_per_sec = (step * batch_size * seq_len * grad_accumulation) / max(
         elapsed, 0.1
     )
     vram_gb = torch.cuda.memory_allocated() / 1e9
 
+    # Structured metrics dict (D3: для интеграции с WandB)
+    metrics = {
+        "step": step,
+        "loss/total": accumulated_loss,
+        "loss/ce": ce_loss.item() if isinstance(ce_loss, torch.Tensor) else ce_loss,
+        "loss/world_model": world_model_loss_val,
+        "loss/sdo": outputs.get("aux_losses", {}).get("sdo_loss", 0),
+        "loss/belief": outputs.get("aux_losses", {}).get("belief_loss", 0),
+        "loss/edh": outputs.get("aux_losses", {}).get("edh_loss", 0),
+        "loss/rel": outputs.get("aux_losses", {}).get("rel_loss", 0),
+        "performance/tokens_per_sec": tokens_per_sec,
+        "performance/vram_gb": vram_gb,
+        "performance/time_elapsed": elapsed,
+    }
+
+    # Human-readable log
     log(
         f"Step {step:4d}/{max_steps} | "
         f"Loss: {accumulated_loss:.4f} | "
@@ -327,6 +343,8 @@ while step < max_steps:
         f"Time: {elapsed:.0f}s | "
         f"WM: {world_model_loss_val:.4f}"
     )
+
+    # TODO: wandb.log(metrics) — когда установят wandb
 
     # Scale health + HAR stats every 50 steps
     if step % 50 == 0:
