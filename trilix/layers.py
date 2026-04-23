@@ -2124,7 +2124,6 @@ class WorldModelHead(nn.Module):
         self.r = r
         self.hidden_dim = hidden_dim
 
-        # Предсказатель: z -> z_next
         self.predictor = nn.Sequential(
             nn.Linear(r, hidden_dim),
             nn.GELU(),
@@ -2143,3 +2142,105 @@ class WorldModelHead(nn.Module):
             z_pred: [batch, r] — предсказанное состояние следующего токена
         """
         return self.predictor(z)
+
+
+class BeliefGate(nn.Module):
+    """A3: Belief Gate — убеждения агента о мире.
+
+    Belief = "что агент знает о мире" — вектор убеждений.
+    Belief Gate модулирует предсказания WorldModel на основе убеждений.
+
+    Как работает:
+    1. Belief state — вектор убеждений [r], обучается вместе с моделью
+    2. Belief update: предсказание - реальность = error → обновляем belief
+    3. Belief gate: z_pred = z_pred * sigmoid(belief) + z * (1 - sigmoid(belief))
+       - high belief → предсказание доминирует
+       - low belief → текущее состояние доминирует
+
+    Аналогия:
+    - Человек с сильными убеждениями ("я знаю как это работает")
+      игнорирует новую информацию и полагается на предсказание
+    - Человек без убеждений ("я не знаю")
+      больше полагается на текущие данные
+
+    Args:
+        r: Latent dimension
+        belief_dim: Dimension of belief representation (default: r//4)
+    """
+
+    def __init__(self, r: int = 100, belief_dim: int = 25):
+        super().__init__()
+        self.r = r
+        self.belief_dim = belief_dim
+
+        self.belief_vector = nn.Parameter(torch.randn(belief_dim) * 0.01)
+
+        self.belief_encoder = nn.Linear(r, belief_dim)
+        self.belief_gate = nn.Sequential(
+            nn.Linear(belief_dim, r),
+            nn.Sigmoid(),
+        )
+
+        self.belief_predictor = nn.Sequential(
+            nn.Linear(r + belief_dim, hidden_dim := r),
+            nn.GELU(),
+            nn.Linear(hidden_dim, r),
+        )
+
+        self.register_buffer("_belief_update_rate", torch.tensor(0.1))
+        self.register_buffer("_last_belief", torch.zeros(belief_dim))
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        z_pred: torch.Tensor,
+        z_actual: Optional[torch.Tensor] = None,
+        return_belief: bool = False,
+    ) -> Dict:
+        """
+        Belief-gated prediction.
+
+        Args:
+            z: [batch, r] — текущее латентное состояние
+            z_pred: [batch, r] — предсказание WorldModel
+            z_actual: [batch, r] — реальное следующее состоятие (для обновления belief)
+            return_belief: вернуть belief state
+
+        Returns:
+            gated_pred: [batch, r] — belief-gated предсказание
+            belief_loss: scalar — loss на обновление belief (если z_actual дан)
+        """
+        batch_size = z.size(0)
+
+        belief_emb = self.belief_encoder(z)
+        gate = self.belief_gate(belief_emb)
+
+        gated_pred = z_pred * gate + z * (1 - gate)
+
+        result = {"gated_pred": gated_pred, "gate": gate}
+
+        if z_actual is not None and self.training:
+            error = (z_pred - z_actual).abs().mean()
+            belief_update = error * self._belief_update_rate
+            self.belief_vector.data += (
+                torch.randn_like(self.belief_vector) * belief_update
+            )
+            self._last_belief.copy_(self.belief_vector.detach())
+
+            result["belief_loss"] = error
+        else:
+            result["belief_loss"] = torch.tensor(0.0, device=z.device)
+
+        if return_belief:
+            result["belief_emb"] = belief_emb
+            result["belief_vector"] = self.belief_vector
+
+        return result
+
+    def get_belief_stats(self) -> Dict:
+        """Статистика убеждений"""
+        belief_magnitude = self.belief_vector.abs().mean().item()
+        return {
+            "belief_magnitude": belief_magnitude,
+            "belief_dim": self.belief_dim,
+        }

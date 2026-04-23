@@ -12,6 +12,7 @@ from .layers import (
     DifferentiableAtomEvolver,
     FlatHierarchicalMoE,
     EmergentAgentSwarm,
+    BeliefGate,
     TemperatureCascadeScheduler,
 )
 from .model import TRILIXTransformer
@@ -23,6 +24,7 @@ __all__ = [
     "DifferentiableAtomEvolver",
     "FlatHierarchicalMoE",
     "EmergentAgentSwarm",
+    "BeliefGate",
     "TemperatureCascadeScheduler",
     "TRILIXTransformer",
 ]

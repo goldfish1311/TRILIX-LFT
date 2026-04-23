@@ -2,7 +2,7 @@
 
 > **Проект**: TRILIX-LFT — Трансформер с экстремальным сжатием до 0.0048 BPW  
 > **Автор**: Evgeny  
-> **Дата**: 2026-04-23 (обновлён 2026-04-23 вечер)  
+> **Дата**: 2026-04-23 (обновлён 2026-04-23 вечер, A3 BeliefGate)  
 > **Статус**: Активная разработка
 
 ---
@@ -20,11 +20,12 @@
 | 5 | **LCC** — Learned Codebook Compressor | ✅ Работает | `e39abf7` |
 | A1 | **Soul Codebook** — 1024 агента в 1 модели | ✅ Работает | `1bbb49f` |
 | A2 | **Latent World Model** — предсказание следующего состояния | ✅ Работает | `bc4006b` |
+| A3 | **Belief Gate** — убеждения агента о мире | ✅ Работает | — |
 | B5 | **SDO** — Symbolic Diff Operations | ✅ Работает | `5421917` |
 | B4 | **HAR** — Hebbian Atom Resonance | ✅ Работает | `d7459fc` |
 | B3 | **DAE** — Differentiable Atom Evolution | ✅ Работает | `9985cda` |
-| B1.5 | **FHC** — Flat Hierarchical Codebook | ✅ Работает | — |
-| B2 | **Agent Swarm** — 1024 агента как рой | ✅ Работает | — |
+| B1.5 | **FHC** — Flat Hierarchical Codebook | ✅ Работает | `7abc392` |
+| B2 | **Agent Swarm** — 1024 агента как рой | ✅ Работает | `7989d06` |
 
 ### Новые цели (документы)
 
@@ -81,7 +82,7 @@
 |---|-----------|--------|--------|
 | A1 | **Soul Codebook** | ✅ ЗАВЕРШЕНО | `1bbb49f` |
 | A2 | **Latent World Model** | ✅ ЗАВЕРШЕНО | `bc4006b` |
-| A3 | **Belief Gate** (от Клода) | 📋 Дополнить A2 | — |
+| A3 | **Belief Gate** | ✅ ЗАВЕРШЕНО | — |
 
 ---
 

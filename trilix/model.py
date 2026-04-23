@@ -12,6 +12,7 @@ from typing import Optional, Tuple, Dict
 from .layers import (
     TRILIXLinear,
     WorldModelHead,
+    BeliefGate,
     SoulCodebook,
     SymbolicDiffLoss,
     STEBinary,
@@ -331,6 +332,9 @@ class TRILIXTransformer(nn.Module):
         )
         self.z_projector = nn.Linear(config.hidden_size, config.rank_r)
 
+        # A3: Belief Gate — убеждения агента о мире
+        self.belief_gate = BeliefGate(r=config.rank_r, belief_dim=config.rank_r // 4)
+
         # A1: Soul Codebook — файл "души" агента
         self.soul_codebook = SoulCodebook(num_agents=1024, r=config.rank_r)
         self.soul_projector = nn.Linear(config.rank_r, config.hidden_size)
@@ -467,9 +471,16 @@ class TRILIXTransformer(nn.Module):
         # Предсказание
         z_pred = self.world_model_head(z_proj)  # [batch, rank]
 
+        # A3: Belief Gate — модулируем предсказание на основе убеждений агента
+        belief_result = self.belief_gate(
+            z_proj, z_pred, z_next_proj, return_belief=False
+        )
+        gated_pred = belief_result["gated_pred"]
+        belief_loss = belief_result["belief_loss"]
+
         # World Model loss — MSE между предсказанным и реальным следующим состоянием
         world_model_loss = F.mse_loss(
-            z_pred, z_next_proj.detach()
+            gated_pred, z_next_proj.detach()
         )  # detach чтобы не мешать CE
 
         # Auxiliary losses
@@ -484,6 +495,9 @@ class TRILIXTransformer(nn.Module):
 
         # A2: World Model loss в сумму aux losses (с весом 0.1 чтобы не доминировать)
         aux_loss_sum = aux_loss_sum + 0.1 * world_model_loss
+
+        # A3: Belief Gate loss
+        aux_loss_sum = aux_loss_sum + 0.05 * belief_loss
 
         # B5: SDO — Symbolic Diff Operations для reasoning
         # Семплируем codebook из первого слоя
@@ -521,6 +535,7 @@ class TRILIXTransformer(nn.Module):
         all_aux_losses["diversity_total"] = diversity_loss
         all_aux_losses["world_model_loss"] = world_model_loss
         all_aux_losses["sdo_loss"] = sdo_loss
+        all_aux_losses["belief_loss"] = belief_loss
 
         return {
             "logits": logits,
