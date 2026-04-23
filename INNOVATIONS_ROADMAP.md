@@ -20,6 +20,17 @@
 | 5 | **LCC** — Learned Codebook Compressor | ✅ Работает | `e39abf7` |
 | A1 | **Soul Codebook** — 1024 агента в 1 модели | ✅ Работает | `1bbb49f` |
 | A2 | **Latent World Model** — предсказание следующего состояния | ✅ Работает | `bc4006b` |
+| B5 | **SDO** — Symbolic Diff Operations | ✅ Работает | `5421917` |
+| B4 | **HAR** — Hebbian Atom Resonance | ✅ Работает | `d7459fc` |
+
+### Новые цели (документы)
+
+| Документ | Описание |
+|----------|----------|
+| `GOALS.md` | Главные цели проекта: 70B+, 1M context, победить Claude/GPT/Gemini |
+| `SOUL.md` | Формат ACTUAL агента с Skills Stack + Meta-Skill Creator |
+| `skills/` | Структура скиллов (python_expert, meta_skill_creator) |
+| `soul/` | Директория для SOUL.md файлов агентов |
 
 ### Исправления
 
@@ -292,6 +303,7 @@ diff_cd = c * d  # "разность" c и d
 | `ef44225` | FEAT: ATC — Adaptive Temperature Cascade |
 | `bc4006b` | FEAT: A2 Latent World Model |
 | `1bbb49f` | FEAT: A1 Soul Codebook — 1024 агента |
+| `d7459fc` | FEAT: B4 Hebbian Atom Resonance |
 
 ---
 
