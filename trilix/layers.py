@@ -2244,3 +2244,318 @@ class BeliefGate(nn.Module):
             "belief_magnitude": belief_magnitude,
             "belief_dim": self.belief_dim,
         }
+
+
+class ErrorDrivenHypernetwork(nn.Module):
+    """C1: EDH — Error-Driven Hypernetwork.
+
+    Гиперсеть, которая получает на вход error-сигнал и генерирует
+    "Builder Weights" — специализированные веса для разных паттернов ошибок.
+
+    Проблема (от Клода): Builder Expert имел circular dependency — ему нужен
+    task_embedding, который получается из выхода сети. EDH решает это:
+    EDH получает ГЛОБАЛЬНЫЙ loss-сигнал, не требует task_embedding от сети.
+
+    Как работает:
+    1. EDH получает loss-сигнал (error embedding)
+    2. Генерирует "error-type embedding" — какой тип ошибки произошёл
+    3. Генерирует builder_weights — специализированные веса для этого типа ошибки
+    4. Builder Weights используются как bias/модуляция в слоях
+
+    Error patterns:
+    - High CE loss → нужно "standard" builder
+    - High WorldModel loss → нужно "prediction" builder
+    - High Diversity loss → нужно "creative" builder
+    - High Belief loss → нужно "skeptical" builder
+
+    Аналогия: EDH = "консультант", который анализирует ошибки команды
+    и даёт каждому совет (builder_weights), как лучше работать.
+
+    Args:
+        error_dim: Размерность error embedding (default: 64)
+        builder_dim: Размерность builder специализации (default: rank_r)
+        num_builders: Количество типов builders (default: 8)
+    """
+
+    def __init__(
+        self, error_dim: int = 64, builder_dim: int = 100, num_builders: int = 8
+    ):
+        super().__init__()
+        self.error_dim = error_dim
+        self.builder_dim = builder_dim
+        self.num_builders = num_builders
+
+        self.error_encoder = nn.Sequential(
+            nn.Linear(4, error_dim),
+            nn.GELU(),
+            nn.Linear(error_dim, error_dim),
+        )
+
+        self.error_type_embedding = nn.Embedding(num_builders, error_dim)
+        nn.init.normal_(self.error_type_embedding.weight, std=0.01)
+
+        self.builder_generator = nn.Sequential(
+            nn.Linear(error_dim, error_dim * 2),
+            nn.GELU(),
+            nn.Linear(error_dim * 2, builder_dim),
+        )
+
+        self.builder_modulation = nn.Sequential(
+            nn.Linear(error_dim, builder_dim),
+            nn.Tanh(),
+        )
+
+        self._registered_builders = nn.ParameterList(
+            [nn.Parameter(torch.randn(builder_dim) * 0.01) for _ in range(num_builders)]
+        )
+
+        self._current_builder_weights: Optional[torch.Tensor] = None
+        self._last_error_type = 0
+
+    def forward(
+        self,
+        ce_loss: torch.Tensor,
+        world_model_loss: torch.Tensor,
+        diversity_loss: torch.Tensor,
+        belief_loss: torch.Tensor,
+        return_builder: bool = False,
+    ) -> Dict:
+        """Forward pass EDH."""
+        ce_val = (
+            ce_loss.detach().mean().item()
+            if ce_loss.numel() > 1
+            else ce_loss.detach().item()
+        )
+        wm_val = (
+            world_model_loss.detach().mean().item()
+            if world_model_loss.numel() > 1
+            else world_model_loss.detach().item()
+        )
+        div_val = (
+            diversity_loss.detach().mean().item()
+            if diversity_loss.numel() > 1
+            else diversity_loss.detach().item()
+        )
+        bel_val = (
+            belief_loss.detach().mean().item()
+            if belief_loss.numel() > 1
+            else belief_loss.detach().item()
+        )
+
+        loss_vector = torch.tensor(
+            [ce_val, wm_val, div_val, bel_val], device=next(self.parameters()).device
+        )
+        loss_vector_norm = loss_vector / (loss_vector.max() + 1e-8)
+
+        error_emb = self.error_encoder(loss_vector_norm.unsqueeze(0)).squeeze(0)
+
+        error_type_raw = error_emb.sum(dim=-1) / (self.error_dim**0.5)
+        error_type = int(torch.argmax(error_type_raw.abs()).item()) % self.num_builders
+        self._last_error_type = error_type
+
+        error_type_emb = self.error_type_embedding(
+            torch.tensor(error_type, device=error_emb.device)
+        )
+
+        combined_emb = error_emb + error_type_emb
+
+        builder_weights = self.builder_generator(combined_emb.unsqueeze(0)).squeeze(0)
+
+        modulation = self.builder_modulation(combined_emb.unsqueeze(0)).squeeze(0)
+        builder_weights = builder_weights * (1.0 + modulation)
+
+        self._current_builder_weights = builder_weights.detach()
+
+        builder_reg_loss = torch.tensor(0.0, device=error_emb.device)
+        if self.training:
+            target_builder = self._registered_builders[error_type]
+            builder_reg_loss = F.mse_loss(builder_weights, target_builder.detach())
+            current_builder_data = self._registered_builders[error_type].data
+            current_builder_data.copy_(
+                current_builder_data * 0.95 + builder_weights.detach() * 0.05
+            )
+
+        result = {
+            "builder_weights": builder_weights,
+            "error_type": error_type,
+            "error_embedding": error_emb,
+            "builder_loss": builder_reg_loss,
+        }
+
+        if return_builder:
+            result["registered_builder"] = self._registered_builders[error_type]
+
+        return result
+
+    def get_builder_for_layer(
+        self,
+        layer_idx: int,
+        num_layers: int,
+    ) -> torch.Tensor:
+        """Get builder weights modulated by layer position."""
+        if self._current_builder_weights is None:
+            return torch.zeros(self.builder_dim, device=next(self.parameters()).device)
+
+        layer_factor = (layer_idx / max(num_layers - 1, 1)) ** 0.5
+        pos_emb = torch.sin(
+            torch.tensor([layer_idx], dtype=torch.float32)
+            / torch.pow(
+                torch.tensor(10000.0),
+                torch.arange(0, self.builder_dim // 4, dtype=torch.float32)
+                / (self.builder_dim // 4),
+            )
+        ).to(self._current_builder_weights.device)
+
+        modulated = self._current_builder_weights * (
+            1.0 + layer_factor * pos_emb[: self.builder_dim]
+        )
+        return modulated
+
+    def get_edh_stats(self) -> Dict:
+        """Статистика EDH."""
+        builder_magnitudes = [b.abs().mean().item() for b in self._registered_builders]
+        mean_mag = sum(builder_magnitudes) / len(builder_magnitudes)
+        return {
+            "builder_magnitude_mean": mean_mag,
+            "builder_magnitude_std": (
+                sum((x - mean_mag) ** 2 for x in builder_magnitudes)
+                / len(builder_magnitudes)
+            )
+            ** 0.5,
+            "num_builders": self.num_builders,
+            "last_error_type": self._last_error_type,
+            "current_builder_magnitude": (
+                self._current_builder_weights.abs().mean().item()
+                if self._current_builder_weights is not None
+                else 0.0
+            ),
+        }
+
+
+class ReflectiveErrorLoop(nn.Module):
+    """C2: REL — Reflective Error Loop.
+
+    Рефлексивный цикл ошибок: модель анализирует СВОИ ошибки
+    и корректирует своё поведение ("я сомневаюсь здесь").
+
+    Как работает:
+    1. Per-token uncertainty estimation — для каждого токена вычисляем
+       "уверенность" модели
+    2. High-uncertainty tokens → повышенный loss при backprop
+    3. Self-correction: модель учится быть увереннее в "сомнительных" местах
+
+    Компоненты:
+    - Uncertainty Estimator: предсказывает variance/entropy для каждого токена
+    - Reflective Loss: CE loss * uncertainty_weight
+    - Confidence Calibration: учит модель быть увереннее когда нужно
+
+    Args:
+        hidden_dim: Размерность hidden states
+        uncertainty_dim: Размерность uncertainty embedding (default: 16)
+    """
+
+    def __init__(self, hidden_dim: int = 256, uncertainty_dim: int = 16):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.uncertainty_dim = uncertainty_dim
+
+        self.uncertainty_estimator = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, uncertainty_dim),
+        )
+
+        self.confidence_predictor = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 4, 1),
+            nn.Sigmoid(),
+        )
+
+        self.uncertainty_gate = nn.Sequential(
+            nn.Linear(uncertainty_dim, 1),
+            nn.Softplus(),
+        )
+
+        self._uncertainty_history_avg: list[float] = []
+        self._uncertainty_history_max: list[float] = []
+        self._step_count = 0
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        return_uncertainty: bool = False,
+    ) -> Dict:
+        """Forward pass REL."""
+        batch_size, seq_len, _ = hidden_states.shape
+
+        uncertainty_emb = self.uncertainty_estimator(hidden_states)
+        uncertainty_gate = self.uncertainty_gate(uncertainty_emb).squeeze(-1)
+
+        confidence = self.confidence_predictor(hidden_states).squeeze(-1)
+
+        probs = F.softmax(logits, dim=-1)
+        entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)
+        entropy_normalized = entropy / (entropy.max() + 1e-8)
+
+        uncertainty_map = entropy_normalized * 0.6 + uncertainty_gate * 0.4
+
+        ce_loss_per_token = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1),
+            reduction="none",
+        ).view(batch_size, seq_len)
+
+        reflective_loss_per_token = ce_loss_per_token * uncertainty_map
+        reflective_loss = reflective_loss_per_token.mean()
+
+        confidence_target = 1.0 - uncertainty_map.detach()
+        confidence_loss = F.binary_cross_entropy(
+            confidence, confidence_target, reduction="none"
+        ).mean()
+
+        correction_strength = uncertainty_map.mean()
+
+        reflective_loss = reflective_loss + 0.1 * confidence_loss
+
+        self._step_count += 1
+        if self._step_count % 100 == 0:
+            self._uncertainty_history_avg.append(uncertainty_map.mean().item())
+            self._uncertainty_history_max.append(uncertainty_map.max().item())
+
+        result = {
+            "reflective_loss": reflective_loss,
+            "uncertainty_map": uncertainty_map,
+            "confidence_loss": confidence_loss,
+            "correction_strength": correction_strength,
+        }
+
+        if return_uncertainty:
+            result["entropy"] = entropy
+            result["uncertainty_gate"] = uncertainty_gate
+            result["confidence"] = confidence
+
+        return result
+
+    def get_rel_stats(self) -> Dict:
+        """Статистика REL."""
+        return {
+            "step_count": self._step_count,
+            "uncertainty_avg_avg": (
+                sum(self._uncertainty_history_avg) / len(self._uncertainty_history_avg)
+                if self._uncertainty_history_avg
+                else 0.0
+            ),
+            "uncertainty_max_avg": (
+                sum(self._uncertainty_history_max) / len(self._uncertainty_history_max)
+                if self._uncertainty_history_max
+                else 0.0
+            ),
+            "uncertainty_trend": (
+                self._uncertainty_history_avg[-1] - self._uncertainty_history_avg[0]
+                if len(self._uncertainty_history_avg) > 1
+                else 0.0
+            ),
+        }

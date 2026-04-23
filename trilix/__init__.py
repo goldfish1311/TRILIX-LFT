@@ -13,6 +13,8 @@ from .layers import (
     FlatHierarchicalMoE,
     EmergentAgentSwarm,
     BeliefGate,
+    ErrorDrivenHypernetwork,
+    ReflectiveErrorLoop,
     TemperatureCascadeScheduler,
 )
 from .model import TRILIXTransformer
@@ -25,6 +27,8 @@ __all__ = [
     "FlatHierarchicalMoE",
     "EmergentAgentSwarm",
     "BeliefGate",
+    "ErrorDrivenHypernetwork",
+    "ReflectiveErrorLoop",
     "TemperatureCascadeScheduler",
     "TRILIXTransformer",
 ]

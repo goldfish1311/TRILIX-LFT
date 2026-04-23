@@ -2,7 +2,7 @@
 
 > **Проект**: TRILIX-LFT — Трансформер с экстремальным сжатием до 0.0048 BPW  
 > **Автор**: Evgeny  
-> **Дата**: 2026-04-23 (обновлён 2026-04-23 вечер, A3 BeliefGate)  
+> **Дата**: 2026-04-23 (обновлён 2026-04-23 вечер, C1 EDH + C2 REL)  
 > **Статус**: Активная разработка
 
 ---
@@ -20,12 +20,14 @@
 | 5 | **LCC** — Learned Codebook Compressor | ✅ Работает | `e39abf7` |
 | A1 | **Soul Codebook** — 1024 агента в 1 модели | ✅ Работает | `1bbb49f` |
 | A2 | **Latent World Model** — предсказание следующего состояния | ✅ Работает | `bc4006b` |
-| A3 | **Belief Gate** — убеждения агента о мире | ✅ Работает | — |
+| A3 | **Belief Gate** — убеждения агента о мире | ✅ Работает | `1cfeb3e` |
 | B5 | **SDO** — Symbolic Diff Operations | ✅ Работает | `5421917` |
 | B4 | **HAR** — Hebbian Atom Resonance | ✅ Работает | `d7459fc` |
 | B3 | **DAE** — Differentiable Atom Evolution | ✅ Работает | `9985cda` |
 | B1.5 | **FHC** — Flat Hierarchical Codebook | ✅ Работает | `7abc392` |
 | B2 | **Agent Swarm** — 1024 агента как рой | ✅ Работает | `7989d06` |
+| C1 | **EDH** — Error-Driven Hypernetwork | ✅ Работает | — |
+| C2 | **REL** — Reflective Error Loop | ✅ Работает | — |
 
 ### Новые цели (документы)
 
@@ -200,15 +202,12 @@ diff_cd = c * d  # "разность" c и d
 
 ---
 
-### Группа C — Продвинутые (не сейчас)
+### Группа C — ✅ Завершено
 
-| # | Инновация | Почему не сейчас |
-|---|-----------|-----------------|
-| **EDH** | Error-Driven Hypernetwork | Слишком сложно, требует отдельного обучения |
-| **REL** | Reflective Error Loop | Per-token loss сложно для synthetic training |
-| **C1** | Recursive Self-Compilation Loops | Builder Expert — circular dependency |
-| **C2** | Dynamic Ephemeral Experts | Inference-time генерация не дифференцируема |
-| **C3** | Meta-Reflective Mutation | Конфликт двух градиентных сигналов |
+| # | Инновация | Статус | Коммит |
+|---|-----------|--------|--------|
+| C1 | **EDH** — Error-Driven Hypernetwork | ✅ ЗАВЕРШЕНО | — |
+| C2 | **REL** — Reflective Error Loop | ✅ ЗАВЕРШЕНО | — |
 
 ---
 

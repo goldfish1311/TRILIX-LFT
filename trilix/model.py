@@ -17,6 +17,8 @@ from .layers import (
     SymbolicDiffLoss,
     STEBinary,
     EmergentAgentSwarm,
+    ErrorDrivenHypernetwork,
+    ReflectiveErrorLoop,
 )
 from .config import TRILIXConfig
 
@@ -335,6 +337,19 @@ class TRILIXTransformer(nn.Module):
         # A3: Belief Gate — убеждения агента о мире
         self.belief_gate = BeliefGate(r=config.rank_r, belief_dim=config.rank_r // 4)
 
+        # C1: EDH — Error-Driven Hypernetwork
+        self.edh = ErrorDrivenHypernetwork(
+            error_dim=64,
+            builder_dim=config.rank_r,
+            num_builders=8,
+        )
+
+        # C2: REL — Reflective Error Loop
+        self.rel = ReflectiveErrorLoop(
+            hidden_dim=config.hidden_size,
+            uncertainty_dim=16,
+        )
+
         # A1: Soul Codebook — файл "души" агента
         self.soul_codebook = SoulCodebook(num_agents=1024, r=config.rank_r)
         self.soul_projector = nn.Linear(config.rank_r, config.hidden_size)
@@ -528,6 +543,30 @@ class TRILIXTransformer(nn.Module):
             sdo_loss = self.symbolic_diff_loss(codebook_U_sdo, codebook_V_sdo)
             aux_loss_sum = aux_loss_sum + sdo_loss
 
+        # C1: EDH — Error-Driven Hypernetwork
+        edh_result = self.edh(
+            ce_loss=ce_loss,
+            world_model_loss=world_model_loss,
+            diversity_loss=diversity_loss,
+            belief_loss=belief_loss,
+        )
+        edh_loss = edh_result["builder_loss"]
+        aux_loss_sum = aux_loss_sum + 0.05 * edh_loss
+
+        # C2: REL — Reflective Error Loop
+        if labels is not None:
+            shift_logits_for_rel = logits[..., :-1, :].contiguous()
+            shift_labels_for_rel = labels[..., 1:].contiguous()
+            rel_result = self.rel(
+                hidden_states=hidden_states,
+                logits=shift_logits_for_rel,
+                labels=shift_labels_for_rel,
+            )
+            rel_loss = rel_result["reflective_loss"]
+        else:
+            rel_loss = torch.tensor(0.0, device=hidden_states.device)
+        aux_loss_sum = aux_loss_sum + 0.05 * rel_loss
+
         total_loss = ce_loss + aux_loss_sum
 
         all_aux_losses["ce_loss"] = ce_loss
@@ -536,6 +575,8 @@ class TRILIXTransformer(nn.Module):
         all_aux_losses["world_model_loss"] = world_model_loss
         all_aux_losses["sdo_loss"] = sdo_loss
         all_aux_losses["belief_loss"] = belief_loss
+        all_aux_losses["edh_loss"] = edh_loss
+        all_aux_losses["rel_loss"] = rel_loss
 
         return {
             "logits": logits,
