@@ -2,7 +2,7 @@
 
 > **Проект**: TRILIX-LFT — Трансформер с экстремальным сжатием до 0.0048 BPW  
 > **Автор**: Evgeny  
-> **Дата**: 2026-04-23 (обновлён 2026-04-24 ночь, багфиксы + новые инновации от Клода)  
+> **Дата**: 2026-04-24 (обновлён 2026-04-24 ночь-утро, D4-D5 добавлены в bugs)  
 > **Статус**: Активная разработка
 
 ---
@@ -351,8 +351,8 @@ diff_cd = c * d  # "разность" c и d
 | **UAS объединять** | Soul и WorldModel уже работают раздельно. | Добавить Belief Gate в WorldModelHead |
 | **Meta-Reflective Mutation** (Гемини) | Конфликт градиентов. | После REL от Клода |
 | **R-MoE как дерево** (Дипсик) | Рекурсия = непрозрачный gradient | Заменить на FHC от Клода |
-| **FHC возвращает центроиды** | Требует переработки архитектуры FHC | После реализации D1 (vectorized EMA) |
-| **World Model causal** | Требует отдельной реализации | После стабилизации базового обучения |
+| **FHC возвращает центроиды** | Перенесено в D5 — переработать на полный кодбук | Не реализовано |
+| **World Model causal** | Перенесено в D4 — token-by-token предсказание | Не реализовано |
 
 ---
 
@@ -374,9 +374,11 @@ diff_cd = c * d  # "разность" c и d
 └── C2: REL
 
 🔴 Немедленно (эта неделя):
-├── D1: EMA vectorized (Python loop → scatter_add_) — критично для скорости
-├── D2: Per-group gradient clipping
+├── D1: EMA vectorized (Python loop → scatter_add_) — критично для скорости [BUG FIX]
+├── D2: Per-group gradient clipping [BUG FIX]
 ├── D3: WandB мониторинг
+├── D4: Causal World Model (token-by-token предсказание) [BUG FIX]
+├── D5: FHC переработка (возвращать полный кодбук, не центроиды) [BUG FIX]
 └── Bug fixes: all_aux_losses reset, gate_proj MoE, commitment direction
 
 🟡 Эта неделя → следующая:
