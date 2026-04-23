@@ -30,6 +30,12 @@ class TRILIXConfig:
     num_experts: int = 4  # Number of codebook experts
     moe_top_k: int = 2  # Top-k experts per token
 
+    # Innovation flags (from Claude)
+    use_saib: bool = False  # Soft Attention Index Blender
+    use_rvq: bool = False  # Residual Vector Quantization
+    use_sgh: bool = False  # Stochastic Group Hierarchy
+    use_lcc: bool = False  # Learned Codebook Compressor
+
     # Scaling factors
     scale_lr_multiplier: float = 10.0
 

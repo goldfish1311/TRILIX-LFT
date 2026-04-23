@@ -42,6 +42,10 @@ def get_trilix_kwargs(config: TRILIXConfig) -> Dict:
         "use_moe": config.use_moe,
         "num_experts": config.num_experts if config.use_moe else 4,
         "moe_top_k": config.moe_top_k if config.use_moe else 2,
+        "use_saib": config.use_saib,
+        "use_rvq": config.use_rvq,
+        "use_sgh": config.use_sgh,
+        "use_lcc": config.use_lcc,
     }
 
 

@@ -221,6 +221,11 @@ class TRILIXLinear(nn.Module):
         use_moe: bool = False,
         num_experts: int = 4,
         moe_top_k: int = 2,
+        # Innovation flags
+        use_saib: bool = False,
+        use_rvq: bool = False,
+        use_sgh: bool = False,
+        use_lcc: bool = False,
     ):
         super().__init__()
 
@@ -233,6 +238,12 @@ class TRILIXLinear(nn.Module):
         self.commitment_beta = commitment_beta
         self.atom_ema_decay = atom_ema_decay
         self.use_moe = use_moe
+
+        # Innovation flags
+        self.use_saib = use_saib
+        self.use_rvq = use_rvq
+        self.use_sgh = use_sgh
+        self.use_lcc = use_lcc
 
         # Temperature for soft XOR (anneals from 1.0 to 0.01)
         # ATC: 3 independent temperatures for cascade freezing
@@ -265,6 +276,51 @@ class TRILIXLinear(nn.Module):
         else:
             self.moe_codebook_U = None
             self.moe_codebook_V = None
+
+        # Innovation modules
+        if use_saib:
+            self.saib_U = SoftAttentionIndexBlender(
+                codebook_size=codebook_size, rank=rank
+            )
+            self.saib_V = SoftAttentionIndexBlender(
+                codebook_size=codebook_size, rank=rank
+            )
+        else:
+            self.saib_U = None
+            self.saib_V = None
+
+        if use_rvq:
+            self.rvq_U = ResidualVectorQuantizer(
+                num_levels=3, codebook_size=codebook_size, rank=rank
+            )
+            self.rvq_V = ResidualVectorQuantizer(
+                num_levels=3, codebook_size=codebook_size, rank=rank
+            )
+        else:
+            self.rvq_U = None
+            self.rvq_V = None
+
+        if use_sgh:
+            self.sgh_U = StochasticGroupHierarchy(
+                codebook_size=codebook_size, rank=rank
+            )
+            self.sgh_V = StochasticGroupHierarchy(
+                codebook_size=codebook_size, rank=rank
+            )
+        else:
+            self.sgh_U = None
+            self.sgh_V = None
+
+        if use_lcc:
+            self.lcc_U = LearnedCodebookCompressor(
+                codebook_size=codebook_size, rank=rank
+            )
+            self.lcc_V = LearnedCodebookCompressor(
+                codebook_size=codebook_size, rank=rank
+            )
+        else:
+            self.lcc_U = None
+            self.lcc_V = None
 
         # Level 2: Codebook indices for U and V
         # Stored as differentiable soft indices for STE
@@ -485,8 +541,27 @@ class TRILIXLinear(nn.Module):
         # Soft version for gradient flow (matmul with softmax weights)
         U_soft = torch.matmul(idx_U_soft, codebook_U)  # [out_features, rank]
 
+        # SAIB: use attention-based blending instead of argmax
+        if self.use_saib and self.saib_U is not None:
+            saib_blend, _ = self.saib_U(U_soft, codebook_U)
+            U_soft = saib_blend
+
         # Commitment loss: encourage soft to stay close to hard
         commitment_loss = self.commitment_beta * F.mse_loss(U_soft.detach(), U_hard)
+
+        # SGH regularization loss
+        sgh_loss = 0.0
+        if self.use_sgh and self.sgh_U is not None:
+            idx_temp = max(self.idx_temperature.item(), 0.1)
+            sgh_loss = self.sgh_U.get_regularization_loss(temperature=idx_temp)
+            self._cached_sgh_loss = sgh_loss
+
+        # LCC loss: encourage diverse codebook generation
+        lcc_loss = 0.0
+        if self.use_lcc and self.lcc_U is not None:
+            generated_cb = self.lcc_U.get_codebook()
+            lcc_loss = 0.001 * (generated_cb**2).mean()
+            self._cached_lcc_loss = lcc_loss
 
         # Update EMA and usage counters
         with torch.no_grad():
@@ -526,6 +601,11 @@ class TRILIXLinear(nn.Module):
         V_hard = codebook_V[idx_V_hard_idx]  # [in_features, rank]
         V_soft = torch.matmul(idx_V_soft, codebook_V)
 
+        # SAIB: use attention-based blending for V
+        if self.use_saib and self.saib_V is not None:
+            saib_blend, _ = self.saib_V(V_soft, codebook_V)
+            V_soft = saib_blend
+
         commitment_loss = self.commitment_beta * F.mse_loss(V_soft.detach(), V_hard)
 
         with torch.no_grad():
@@ -542,6 +622,26 @@ class TRILIXLinear(nn.Module):
                     self.codebook_V_count[i] += 1
 
         V_final = STEIndex.apply(V_soft, V_hard)
+
+        # SGH regularization loss for V
+        if self.use_sgh and self.sgh_V is not None:
+            idx_temp = max(self.idx_temperature.item(), 0.1)
+            sgh_loss_v = self.sgh_V.get_regularization_loss(temperature=idx_temp)
+            self._cached_sgh_loss = (
+                self._cached_sgh_loss + sgh_loss_v
+                if hasattr(self, "_cached_sgh_loss")
+                else sgh_loss_v
+            )
+
+        # LCC loss for V
+        if self.use_lcc and self.lcc_V is not None:
+            generated_cb = self.lcc_V.get_codebook()
+            lcc_loss_v = 0.001 * (generated_cb**2).mean()
+            self._cached_lcc_loss = (
+                self._cached_lcc_loss + lcc_loss_v
+                if hasattr(self, "_cached_lcc_loss")
+                else lcc_loss_v
+            )
 
         return V_final, V_soft, commitment_loss
 
@@ -692,6 +792,16 @@ class TRILIXLinear(nn.Module):
             aux_losses["agi_diversity"] = torch.tensor(0.0, device=output.device)
             aux_losses["agi_total"] = torch.tensor(0.0, device=output.device)
             self._cached_agi_loss = torch.tensor(0.0, device=output.device)
+
+        # Innovation losses (SGH, LCC)
+        sgh_loss = getattr(
+            self, "_cached_sgh_loss", torch.tensor(0.0, device=output.device)
+        )
+        lcc_loss = getattr(
+            self, "_cached_lcc_loss", torch.tensor(0.0, device=output.device)
+        )
+        aux_losses["sgh_loss"] = sgh_loss
+        aux_losses["lcc_loss"] = lcc_loss
 
         # Atom diversity tracking (for monitoring)
         atoms_U_bin, atoms_V_bin = self._get_atoms_binary()
