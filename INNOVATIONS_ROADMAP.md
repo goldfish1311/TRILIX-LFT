@@ -2,7 +2,7 @@
 
 > **Проект**: TRILIX-LFT — Трансформер с экстремальным сжатием до 0.0048 BPW  
 > **Автор**: Evgeny  
-> **Дата**: 2026-04-24 (обновлён 2026-04-24 ночь-утро, D4-D5 добавлены в bugs)  
+> **Дата**: 2026-04-24 (обновлён 2026-04-24 утро, Stateful World Model — топ-идея)  
 > **Статус**: Активная разработка
 
 ---
@@ -221,6 +221,266 @@ diff_cd = c * d  # "разность" c и d
 
 ---
 
+### Группа W — Stateful World Model (НОВАЯ, ТОП-ИДЕЯ)
+
+**Источник**: переосмысление World Model — не "предсказать следующий токен", а **симуляция мира с законами физики**.
+
+**Статус**: 🟠 Идея — не реализовано
+
+**Почему это топ-идея:**
+Google Gemini и Deepseek R1 используют World Model для reasoning. TRILIX с настоящим World Model получит способность "проигрывать" последствия действий внутри себя — как человек планирует "что будет если я сделаю X".
+
+#### Почему текущий World Model — не World Model
+
+**Клод предложил** "сделать causal" — z[t] → z[t+1]. Но это просто **Causal Predictor**, не World Model.
+
+**Настоящий World Model:**
+```
+State[t] + Action → State[t+1]
+```
+Внутренняя симуляция мира. Агент может "проигрывать" альтернативные будущие.
+
+**Текущий код TRILIX:**
+```python
+z = hidden_states.mean(dim=1)           # среднее всей последовательности
+z_next = hidden_states[:, 1:, :].mean(dim=1)  # среднее хвоста
+z_pred = world_model_head(z)             # просто предсказание среднего
+```
+Это **не симуляция**, а **mean pooling**. Нет физики, нет state, нет constraint'ов.
+
+#### Компоненты Stateful World Model
+
+| Компонент | Что делает | Уже есть |
+|----------|------------|----------|
+| **World State** | Persistent состояние мира между шагами | ❌ |
+| **Physics Rules** | Learned constraint'ы (гравитация, время, причинность) | Частичн�� |
+| **Consequence Simulation** | Multi-step предсказание "что будет если X" | ❌ |
+| **Belief Accumulation** | Накопление убеждений о мире (BeliefGate) | ✅ BeliefGate |
+| **Error Correction** | EDH исправляет ошибки симуляции | ✅ EDH |
+
+#### Как работает (архитектура)
+
+```
+                    TRILIX TRANSFORMER
+                          │
+                          ▼
+    ┌─────────────────────┴─────────────────────┐
+    │              WORLD MODEL (STATEFUL)        │
+    │                                          │
+    │  ┌──────────────┐    ┌──────────────────┐ │
+    │  │ World State  │───▶│ Physics Rules    │ │
+    │  │ (persistent) │    │ (learned const.) │ │
+    │  └──────────────┘    └──────────────────┘ │
+    │         │                      │          │
+    │         │                      ▼          │
+    │         │    ┌─────────────────────────┐  │
+    │         │    │ Consequence Simulator   │  │
+    │         │    │ "что будет если X?"     │  │
+    │         │    │ (n-step lookahead)      │  │
+    │         │    └─────────────────────────┘  │
+    │         │                      │          │
+    │         │                      ▼          │
+    │         │    ┌─────────────────────────┐  │
+    │         └────│ Belief Gate (accum.)    │  │
+    │              │ "я знаю как это работает"│  │
+    │              └─────────────────────────┘  │
+    │                      │                    │
+    │                      ▼                    │
+    │              ┌──────────────────┐         │
+    │              │ EDH (error corr) │         │
+    │              │ "предсказание ≠  │         │
+    │              │  реальность"     │         │
+    │              └──────────────────┘         │
+    └──────────────────────────────────────────┘
+                          │
+                          ▼
+                   Следующий токен
+```
+
+#### Реализация в коде
+
+```python
+class StatefulWorldModel(nn.Module):
+    """W: Stateful World Model — симуляция мира с законами физики.
+    
+    Отличие от "causal predictor":
+    - Causal: z[t] → z[t+1] (просто следующий токен)
+    - World Model: State + Action → State[t+1] (симуляция возможных будущих)
+    """
+    
+    def __init__(self, r, world_state_dim=64):
+        super().__init__()
+        
+        # World State — persistent между forward passes
+        # Может храниться в model или в специальном буфере
+        self.world_state = None  # Инициализируется при первом forward
+        
+        # Physics Rules — learned constraint'ы
+        # Эти веса кодируют "законы мира": гравитация, время, причинность
+        self.physics_encoder = nn.Sequential(
+            nn.Linear(r, r * 2),
+            nn.GELU(),
+            nn.Linear(r * 2, r),  # output: next state prediction
+        )
+        
+        # Consequence Simulator — "что будет если X"
+        self.consequence_simulator = nn.Sequential(
+            nn.Linear(r, r * 2),
+            nn.GELU(),
+            nn.Linear(r * 2, r),
+            # Output: возможные следующие состояния
+        )
+        
+        # Constraint Encoder — кодирует физические ограничения
+        # Например: "яблоко может упасть, но не полететь вверх без причины"
+        self.constraint_encoder = nn.Sequential(
+            nn.Linear(r, r // 2),
+            nn.GELU(),
+            nn.Linear(r // 2, r),
+            nn.Sigmoid(),  # gate: 0 = constraint applies, 1 = no constraint
+        )
+        
+    def reset_state(self):
+        """Сбросить world state для новой задачи/сессии"""
+        self.world_state = None
+    
+    def forward(self, z_current, action_emb=None, simulate=False):
+        """
+        Args:
+            z_current: [batch, r] — текущее состояние из TRILIX
+            action_emb: [batch, r] — эмбеддинг действия (если есть)
+            simulate: True = только симуляция, без обновления state
+            
+        Returns:
+            world_state_pred: предсказанное следующее состояние
+            consequences: возможные альтернативные будущие
+        """
+        if self.world_state is None or not self.training:
+            self.world_state = z_current.detach().clone()
+        
+        # Combine current observation with persistent state
+        if action_emb is not None:
+            combined = self.world_state + action_emb
+        else:
+            combined = self.world_state + z_current
+        
+        # Apply physics rules
+        physics_pred = self.physics_encoder(combined)
+        
+        # Apply constraints (learned physical laws)
+        constraint_gate = self.constraint_encoder(physics_pred)
+        physics_pred_constrained = physics_pred * constraint_gate
+        
+        if simulate:
+            # Just simulate consequences, don't update state
+            consequences = self.consequence_simulator(physics_pred_constrained)
+            return physics_pred_constrained, consequences
+        
+        # Update world state (EMA for stability)
+        alpha = 0.9 if self.training else 1.0
+        self.world_state = alpha * self.world_state + (1 - alpha) * z_current.detach()
+        
+        # Return prediction
+        return physics_pred_constrained, None
+    
+    def predict_consequences(self, action_emb, num_steps=5):
+        """'Что будет если я сделаю X?' — n-step lookahead"""
+        results = []
+        state = self.world_state.detach().clone()
+        
+        for step in range(num_steps):
+            state = self.physics_encoder(state + action_emb)
+            state = state * self.constraint_encoder(state)
+            results.append(state)
+        
+        return torch.stack(results, dim=1)  # [batch, steps, r]
+
+
+class WorldModelLoss(nn.Module):
+    """Loss для Stateful World Model — учит физику и причинность."""
+    
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self, z_current, world_state_pred, z_actual):
+        """
+        Args:
+            z_current: [batch, r] — текущее состояние
+            world_state_pred: [batch, r] — предсказанное состояние мира
+            z_actual: [batch, r] — реальное следующее состояние
+        """
+        # 1. Base prediction loss
+        base_loss = F.mse_loss(world_state_pred, z_actual.detach())
+        
+        # 2. Physics consistency — предсказания должны быть согласованы
+        # Если A→B и B→C, то A→C (транзитивность физики)
+        physics_loss = self._transitivity_loss(world_state_pred, z_current)
+        
+        # 3. Constraint satisfaction — предсказания не нарушают законы
+        constraint_violation = self._constraint_loss(world_state_pred)
+        
+        return base_loss + 0.1 * physics_loss + 0.05 * constraint_violation
+    
+    def _transitivity_loss(self, pred, current):
+        """A→B + B→C ≈ A→C"""
+        ab = pred * current
+        bc = pred * pred
+        ac = current * current
+        return (1 - (ab * bc * ac).sum(dim=-1) / pred.size(-1)).mean()
+    
+    def _constraint_loss(self, state):
+        """State не должен выходить за физически допустимые границы"""
+        return (state.abs() - 3.0).clamp(0).mean()  # L2 sphere constraint
+```
+
+#### Чем это лучше обычного causal predictor
+
+| Свойство | Causal Predictor | Stateful World Model |
+|----------|------------------|----------------------|
+| Stateful | ❌ | ✅ |
+| Multi-step lookahead | ❌ | ✅ |
+| Physics constraints | ❌ | ✅ |
+| Consequence simulation | ❌ | ✅ |
+| "Что если" reasoning | ❌ | ✅ |
+| Belief accumulation | Partial | ✅ Full |
+| Физическая осмысленность | ❌ | ✅ |
+
+#### Интеграция в TRILIXTransformer
+
+```python
+# В model.py __init__:
+self.world_model = StatefulWorldModel(r=config.rank_r, world_state_dim=config.rank_r // 2)
+
+# В forward:
+z_current = hidden_states.mean(dim=1)  # текущее состояние
+z_actual = hidden_states[:, 1:, :].mean(dim=1).detach()  # реальность для сравнения
+
+world_pred, consequences = self.world_model(
+    z_current, 
+    action_emb=soul_vector,  # действие = выбор агента
+)
+
+world_model_loss = WorldModelLoss()(z_current, world_pred, z_actual)
+
+# Consequence simulation для reasoning:
+if self.training:
+    possible_future = self.world_model.predict_consequences(
+        action_emb=task_emb, num_steps=5
+    )
+    # possible_future: что будет через 5 шагов если сделать task_emb
+```
+
+#### Файлы
+`layers.py` (StatefulWorldModel, WorldModelLoss), `model.py` (интеграция)
+
+#### Почему это топ-идея
+1. **Google Gemini использует World Model** для multi-step reasoning
+2. **Deepseek R1** использует "что будет если" для планирования
+3. **TRILIX + Stateful World Model** = первая модель с 0.005 BPW и настоящим reasoning
+4. **Это то что отличает AGI от autocomplete** — способность симулировать будущее
+
+---
+
 ## Новые инновации от Клода (апрель 2026)
 
 Источник: полный архитектурный разбор всего кода TRILIX. 10 инноваций для максимизации качества при сохранении 0.005 BPW.
@@ -352,7 +612,7 @@ diff_cd = c * d  # "разность" c и d
 | **Meta-Reflective Mutation** (Гемини) | Конфликт градиентов. | После REL от Клода |
 | **R-MoE как дерево** (Дипсик) | Рекурсия = непрозрачный gradient | Заменить на FHC от Клода |
 | **FHC возвращает центроиды** | Перенесено в D5 — переработать на полный кодбук | Не реализовано |
-| **World Model causal** | Перенесено в D4 — token-by-token предсказание | Не реализовано |
+| **World Model causal** | Заменено на Stateful World Model (группа W) — настоящая симуляция мира с physics rules | Группа W |
 
 ---
 
@@ -377,8 +637,7 @@ diff_cd = c * d  # "разность" c и d
 ├── D1: EMA vectorized (Python loop → scatter_add_) — критично для скорости [BUG FIX]
 ├── D2: Per-group gradient clipping [BUG FIX]
 ├── D3: WandB мониторинг
-├── D4: Causal World Model (token-by-token предсказание) [BUG FIX]
-├── D5: FHC переработка (возвращать полный кодбук, не центроиды) [BUG FIX]
+├── D4: FHC переработка (возвращать полный кодбук, не центроиды) [BUG FIX]
 └── Bug fixes: all_aux_losses reset, gate_proj MoE, commitment direction
 
 🟡 Эта неделя → следующая:
