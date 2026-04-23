@@ -830,3 +830,133 @@ class TemperatureCascadeScheduler:
                 module.xor_temperature.data.fill_(temps["atom_temp"])
                 module.codebook_temperature.data.fill_(temps["codebook_temp"])
                 module.idx_temperature.data.fill_(temps["idx_temp"])
+
+
+class StochasticGroupHierarchy(nn.Module):
+    """Innovation 2: SGH - Stochastic Group Hierarchy for codebook regularization."""
+
+    def __init__(
+        self, codebook_size: int, rank: int, num_groups: int = 4, num_subgroups: int = 4
+    ):
+        super().__init__()
+        self.k = codebook_size
+        self.r = rank
+        self.num_groups = num_groups
+        self.num_subgroups = num_subgroups
+
+        self.group_logits = nn.Parameter(torch.randn(codebook_size, num_groups) * 0.01)
+        self.subgroup_logits = nn.Parameter(
+            torch.randn(codebook_size, num_groups, num_subgroups) * 0.01
+        )
+
+    def get_group_assignment(self, temperature: float = 1.0):
+        """Returns soft group/subgroup assignments."""
+        group_soft = F.softmax(self.group_logits / max(temperature, 0.1), dim=-1)
+        subgroup_soft = F.softmax(self.subgroup_logits / max(temperature, 0.1), dim=-1)
+        return group_soft, subgroup_soft
+
+    def get_regularization_loss(self, temperature: float = 1.0):
+        """SGH regularization: uniform group usage + confident assignment."""
+        group_soft, _ = self.get_group_assignment(temperature)
+        group_usage = group_soft.sum(dim=0)
+        uniform_loss = ((group_usage / group_usage.mean()) - 1.0).abs().mean()
+        entropy_loss = -(group_soft * (group_soft + 1e-8).log()).sum(dim=-1).mean()
+        return 0.01 * (uniform_loss + 0.1 * entropy_loss)
+
+
+class ResidualVectorQuantizer(nn.Module):
+    """Innovation 3: RVQ - Residual Vector Quantization."""
+
+    def __init__(self, num_levels: int = 3, codebook_size: int = 16, rank: int = 64):
+        super().__init__()
+        self.num_levels = num_levels
+        self.k = codebook_size
+        self.r = rank
+        for i in range(num_levels):
+            self.register_parameter(
+                f"codebook_level_{i}",
+                nn.Parameter(torch.randn(codebook_size, rank) * 0.01),
+            )
+            self.register_parameter(
+                f"idx_logits_level_{i}",
+                nn.Parameter(torch.randn(1, codebook_size) * 0.01),
+            )
+
+    def forward(self, x: torch.Tensor):
+        batch = x.shape[0]
+        total = torch.zeros(batch, self.r, device=x.device, dtype=x.dtype)
+        indices = []
+        for lvl in range(self.num_levels):
+            cb = getattr(self, f"codebook_level_{lvl}")
+            lg = getattr(self, f"idx_logits_level_{lvl}")
+            scores = lg @ cb.T
+            idx = scores.argmax(dim=-1)
+            indices.append(idx.item())
+            total = total + cb[idx.squeeze(0)]
+        return total, torch.tensor(indices, device=x.device)
+
+    def get_codebook_size_effective(self) -> int:
+        return self.k**self.num_levels
+
+
+class SoftAttentionIndexBlender(nn.Module):
+    """Innovation 1: SAIB - Soft Attention for Index Blending.
+
+    Uses attention over codebook indices for smoother quantization.
+    Instead of hard argmax, computes weighted blend of codebook entries.
+    """
+
+    def __init__(self, codebook_size: int, rank: int, num_heads: int = 4):
+        super().__init__()
+        self.k = codebook_size
+        self.r = rank
+        self.num_heads = num_heads
+
+        self.query_proj = nn.Linear(rank, rank)
+        self.key_proj = nn.Linear(rank, rank)
+        self.value_proj = nn.Linear(rank, rank)
+        self.scale = rank**-0.5
+
+    def forward(self, x: torch.Tensor, codebook: torch.Tensor):
+        """Attention-weighted codebook blend."""
+        batch = x.shape[0]
+
+        q = self.query_proj(x).unsqueeze(1)  # [batch, 1, r]
+        k = self.key_proj(codebook).unsqueeze(0)  # [batch, k, r]
+        v = self.value_proj(codebook).unsqueeze(0)  # [batch, k, r]
+
+        attn_weights = torch.softmax(q @ k.transpose(-2, -1) * self.scale, dim=-1)
+
+        blended = (attn_weights @ v).squeeze(1)  # [batch, r]
+        hard_idx = attn_weights.argmax(dim=-1)
+
+        return blended, hard_idx.squeeze(-1)
+
+
+class LearnedCodebookCompressor(nn.Module):
+    """Innovation 5: LCC - Learned Codebook Compressor.
+
+    Uses small MLP to predict codebook entries from latent codes.
+    This enables on-the-fly codebook generation instead of fixed storage.
+    """
+
+    def __init__(self, codebook_size: int, rank: int, hidden_dim: int = 32):
+        super().__init__()
+        self.k = codebook_size
+        self.r = rank
+
+        self.encoder = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, rank),
+        )
+
+        self.latent_codes = nn.Parameter(torch.randn(codebook_size, hidden_dim) * 0.01)
+
+    def forward(self):
+        """Generate full codebook from latent codes."""
+        return self.encoder(self.latent_codes)  # [k, hidden] -> [k, r]
+
+    def get_codebook(self) -> torch.Tensor:
+        """Get current codebook."""
+        return self.forward()
