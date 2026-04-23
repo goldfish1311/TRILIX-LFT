@@ -235,7 +235,12 @@ class TRILIXLinear(nn.Module):
         self.use_moe = use_moe
 
         # Temperature for soft XOR (anneals from 1.0 to 0.01)
-        self.register_buffer("xor_temperature", torch.tensor(1.0))
+        # ATC: 3 independent temperatures for cascade freezing
+        self.register_buffer("xor_temperature", torch.tensor(1.0))  # atom level
+        self.register_buffer(
+            "codebook_temperature", torch.tensor(1.0)
+        )  # codebook level
+        self.register_buffer("idx_temperature", torch.tensor(1.0))  # index level
         self.xor_temp_steps = 0
 
         # Scale clamping (prevent runaway)
@@ -399,17 +404,11 @@ class TRILIXLinear(nn.Module):
         # [codebook_size, rank]
         combined = weighted.sum(dim=1)
 
-        # Apply tanh with temperature for smoother gradients during early training
-        # Temperature anneals from 1.0 -> 0.01 -> 0 (switch to hard sign)
-        temp = self.xor_temperature.item()
-        if self.xor_temp_steps < 2000 and temp > 0.05:
-            # Soft phase: use tanh for gradients
+        # ATC: use codebook_temperature for codebook entry decoding
+        temp = self.codebook_temperature.item()
+        if temp > 0.05:
             combined = torch.tanh(combined / temp)
-            # Hard phase: use STE for efficiency
-            codebook = STEBinary.apply(combined)
-        else:
-            # Hard phase: pure sign() + STE
-            codebook = STEBinary.apply(combined)
+        codebook = STEBinary.apply(combined)
 
         return codebook
 
@@ -433,8 +432,8 @@ class TRILIXLinear(nn.Module):
         Returns:
             soft_codebook: [codebook_size, rank] - soft codewords
         """
-        # Use current temperature, but clamp to avoid instability
-        temp = max(self.xor_temperature.item(), 0.1)
+        # ATC: use codebook_temperature for soft decoding too
+        temp = max(self.codebook_temperature.item(), 0.1)
 
         # 1. Soft combination indices (NO argmax, NO STE!)
         # Shape: [codebook_size, xor_arity, num_atoms]
@@ -471,10 +470,10 @@ class TRILIXLinear(nn.Module):
             self.combo_weights_U, combo_idx_U, atoms_U_bin
         )
 
-        # Get indices for each row of U
-        # Soft indices for training
+        # ATC: use idx_temperature for index selection
+        idx_temp = max(self.idx_temperature.item(), 0.1)
         idx_U_soft = F.softmax(
-            self.idx_U_logits, dim=-1
+            self.idx_U_logits / idx_temp, dim=-1
         )  # [out_features, codebook_size]
 
         # Hard indices (one-hot)
@@ -519,7 +518,9 @@ class TRILIXLinear(nn.Module):
             self.combo_weights_V, combo_idx_V, atoms_V_bin
         )
 
-        idx_V_soft = F.softmax(self.idx_V_logits, dim=-1)
+        idx_V_soft = F.softmax(
+            self.idx_V_logits / max(self.idx_temperature.item(), 0.1), dim=-1
+        )
         idx_V_hard_idx = torch.argmax(idx_V_soft, dim=-1)
 
         V_hard = codebook_V[idx_V_hard_idx]  # [in_features, rank]
@@ -796,3 +797,36 @@ class TRILIXLinear(nn.Module):
         stats["bpw_eval"] = total_eval / original_bits
 
         return stats
+
+
+class TemperatureCascadeScheduler:
+    """
+    Innovation 4: ATC — Adaptive Temperature Cascade
+    Freezing order: atoms (fast) -> codebook combos (medium) -> row indices (slow)
+    Analogy: learn alphabet first -> then words -> then word choice per neuron
+    """
+
+    def __init__(self, total_steps: int, warmup_steps: int = 500):
+        self.total = total_steps
+        self.warmup = warmup_steps
+
+    def get_temperatures(self, step: int) -> dict:
+        if step < self.warmup:
+            return {"atom_temp": 1.0, "codebook_temp": 1.0, "idx_temp": 1.0}
+        progress = min(1.0, (step - self.warmup) / max(1, self.total - self.warmup))
+        atom_temp = max(0.01, 1.0 * math.exp(-progress * 10))
+        codebook_temp = max(0.01, 1.0 * math.exp(-progress * 4))
+        idx_temp = max(0.01, 1.0 * math.exp(-progress * 1.5))
+        return {
+            "atom_temp": atom_temp,
+            "codebook_temp": codebook_temp,
+            "idx_temp": idx_temp,
+        }
+
+    def apply_to_model(self, model, step: int):
+        temps = self.get_temperatures(step)
+        for module in model.modules():
+            if isinstance(module, TRILIXLinear):
+                module.xor_temperature.data.fill_(temps["atom_temp"])
+                module.codebook_temperature.data.fill_(temps["codebook_temp"])
+                module.idx_temperature.data.fill_(temps["idx_temp"])

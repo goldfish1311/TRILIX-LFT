@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 from trilix.config import TRILIXConfig
 from trilix.model import TRILIXTransformer
+from trilix.layers import TemperatureCascadeScheduler
 import time
 import os
 
@@ -106,6 +107,7 @@ batch_size = 1
 seq_len = 256
 grad_accumulation = 16
 max_steps = 5000
+temp_scheduler = TemperatureCascadeScheduler(total_steps=max_steps, warmup_steps=500)
 
 log(f"\nTraining config:")
 log(f"  Batch size: {batch_size}")
@@ -114,11 +116,10 @@ log(f"  Gradient accumulation: {grad_accumulation}")
 log(f"  Effective batch: {batch_size * grad_accumulation}")
 log(f"  Max steps: {max_steps}")
 log(f"  MoE enabled: {config.use_moe}")
-log(f"  AGI Phases: 0-300 frozen, 300-500 gradual, 500+ full")
-
+log(f"  ATC: atom → codebook → idx cascading temperatures")
 log(f"\n{'=' * 60}")
 log(f"TRILIX Small + MoE Training")
-log(f"AGI: 0-300 combo stabilization → 300-500 atom warmup → 500+ full AGI")
+log(f"ATC: atom_temp (fastest freeze) → codebook_temp → idx_temp (slowest)")
 log(f"{'=' * 60}\n")
 
 # Set higher xor_temperature for softer AGI at start
@@ -130,31 +131,7 @@ for layer in model.modules():
 
 
 # AGI Phase Scheduler with Temperature Annealing
-def set_agi_phase(model, step):
-    for layer in model.modules():
-        if hasattr(layer, "atoms_U") and hasattr(layer, "agi_phase"):
-            if step < 300:
-                layer.atoms_U.requires_grad = False
-                layer.atoms_V.requires_grad = False
-                layer.agi_phase = 0
-                layer.agi_weight = 0.0
-            elif step < 500:
-                layer.atoms_U.requires_grad = True
-                layer.atoms_V.requires_grad = True
-                layer.agi_phase = 1
-                progress = (step - 300) / 200
-                layer.agi_weight = 0.01 * progress
-            else:
-                layer.agi_phase = 1
-                layer.agi_weight = min(0.1, 0.01 + (step - 500) * 0.0001)
-
-            # Temperature annealing: 2.0 -> 1.0 over steps 0-1000
-            if step < 1000:
-                new_temp = 2.0 - (step / 1000) * 1.0  # Linear anneal
-            else:
-                new_temp = 1.0
-            if hasattr(layer, "xor_temperature"):
-                layer.xor_temperature.data.fill_(new_temp)
+set_agi_phase = None  # removed - ATC scheduler used instead
 
 
 step = 0
@@ -179,8 +156,7 @@ model.train()
 
 while step < max_steps:
     for accum_idx in range(grad_accumulation):
-        # Update AGI phase before forward
-        set_agi_phase(model, step)
+        # ATC scheduler applied via temp_scheduler.step() call below
 
         # Generate synthetic batch
         input_ids = torch.randint(
@@ -257,6 +233,9 @@ while step < max_steps:
 
     optimizer.step()
     optimizer.zero_grad()
+
+    # Apply ATC temperatures
+    temp_scheduler.apply_to_model(model, step)
 
     step += 1
 
