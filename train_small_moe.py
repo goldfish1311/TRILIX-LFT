@@ -76,6 +76,15 @@ log(
     f"Trainable params: {grad_count}/{total_count} ({100 * grad_count / total_count:.0f}%)"
 )
 
+# B4: Enable Hebbian Atom Resonance (HAR) on all TRILIXLinear layers
+log("\nB4: Enabling Hebbian Atom Resonance (HAR)...")
+har_layer_count = 0
+for layer in model.modules():
+    if hasattr(layer, "enable_har"):
+        layer.enable_har(resonance_interval=200)
+        har_layer_count += 1
+log(f"  HAR enabled on {har_layer_count} TRILIXLinear layers")
+
 # Optimizer - differential learning rates
 scale_params = []
 binary_params = []
@@ -277,13 +286,23 @@ while step < max_steps:
         f"WM: {world_model_loss_val:.4f}"
     )
 
-    # Scale health
-    if scale_params:
-        scale_max = max(p.abs().max().item() for p in scale_params)
-        if scale_max > 9.0:
-            log(f"  ⚠️  Scales near boundary ({scale_max:.2f})")
-        elif 3.0 < scale_max < 7.0:
-            log(f"  ✅ Scales healthy ({scale_max:.2f})")
+    # Scale health + HAR stats every 50 steps
+    if step % 50 == 0:
+        if scale_params:
+            scale_max = max(p.abs().max().item() for p in scale_params)
+            if scale_max > 9.0:
+                log(f"  ⚠️  Scales near boundary ({scale_max:.2f})")
+            elif 3.0 < scale_max < 7.0:
+                log(f"  ✅ Scales healthy ({scale_max:.2f})")
+        total_dead = 0
+        total_har = 0
+        for layer in model.modules():
+            if hasattr(layer, "use_har") and layer.use_har and layer.har is not None:
+                stats = layer.har.get_stats()
+                total_dead += stats["dead_atoms_U"] + stats["dead_atoms_V"]
+                total_har += 1
+        if total_har > 0 and total_dead > 0:
+            log(f"  🧬 HAR: {total_dead} dead atoms across {total_har} layers")
 
     # 3-minute time limit
     if elapsed > 180:

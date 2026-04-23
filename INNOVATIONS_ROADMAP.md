@@ -81,9 +81,9 @@
 
 #### B4: Hebbian Atom Resonance (HAR) ⭐
 **Источник**: Клод (оригинальная)  
-**Статус**: 📋 Запланировано — **следующая инновация**
+**Статус**: ✅ ЗАВЕРШЕНО — 2026-04-23
 
-**Суть**: Принцип Хебба: "Нейроны, которые активаются вместе — соединяются". Работ��ет без градиентов.
+**Суть**: Принцип Хебба: "Нейроны, которые активируются вместе — соединяются". Работает без градиентов.
 
 **Как работает:**
 1. После каждого forward: собирает статистику co-activation и success_score
@@ -195,12 +195,9 @@ diff_cd = c * d  # "разность" c и d
 ├── A1: Soul Codebook
 └── A2: Latent World Model
 
-📋 Следующие (B4 → B5 → B3):
+📋 Следующие (B4 → B3):
 ├── B4: Hebbian Atom Resonance (~2 дня)
 │   └── files: layers.py, train.py
-│
-├── B5: Symbolic Diff Operations (~1 день) ← внедряем сейчас
-│   └── files: layers.py, model.py, train.py
 │
 ├── B3: Differentiable Atom Evolution (~3 дня)
 │   └── files: evolution.py (новый), train.py

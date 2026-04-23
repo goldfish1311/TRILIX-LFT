@@ -192,8 +192,222 @@ class STEIndex(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         (x_soft,) = ctx.saved_tensors
-        # Gradient flows to soft version
         return grad_output, None
+
+
+class HebbianAtomResonance(nn.Module):
+    """
+    B4: Hebbian Atom Resonance (HAR)
+
+    Hebbian principle: "neurons that fire together — wire together"
+
+    Operates WITHOUT gradients. Runs as a periodic post-forward hook.
+
+    Tracks:
+    - Co-activation: how often atoms are selected together
+    - Dead atoms: never used in the last N steps
+    - Resonant pairs: frequently together + too similar (redundant)
+
+    Actions every N steps:
+    - Resonant pairs → flip bits to increase orthogonality
+    - Dead atoms → replace with mutants of successful atoms
+    """
+
+    def __init__(
+        self,
+        num_atoms: int,
+        rank: int,
+        resonance_interval: int = 200,
+        dead_threshold: int = 50,
+        resonance_threshold: float = 0.3,
+        similarity_threshold: float = 0.85,
+        mutation_strength: float = 0.1,
+        resonance_strength: float = 0.5,
+    ):
+        super().__init__()
+        self.num_atoms = num_atoms
+        self.rank = rank
+        self.resonance_interval = resonance_interval
+        self.dead_threshold = dead_threshold
+        self.resonance_threshold = resonance_threshold
+        self.similarity_threshold = similarity_threshold
+        self.mutation_strength = mutation_strength
+        self.resonance_strength = resonance_strength
+
+        self.register_buffer("_step_counter", torch.zeros(1, dtype=torch.long))
+        self.register_buffer("_co_activation_U", torch.zeros(num_atoms, num_atoms))
+        self.register_buffer("_co_activation_V", torch.zeros(num_atoms, num_atoms))
+        self.register_buffer("_atom_hits_U", torch.zeros(num_atoms))
+        self.register_buffer("_atom_hits_V", torch.zeros(num_atoms))
+        self._registered = False
+
+    def register_with_layer(self, layer: "TRILIXLinear"):
+        """Register this HAR with a TRILIXLinear layer"""
+        self._layer = layer
+        self._registered = True
+
+    def observe(
+        self,
+        combo_indices_U: torch.Tensor,
+        combo_indices_V: torch.Tensor,
+        atoms_U: torch.Tensor,
+        atoms_V: torch.Tensor,
+    ):
+        """
+        Observe atom usage from forward pass (no gradients).
+
+        Args:
+            combo_indices_U: [codebook_size, xor_arity, num_atoms] one-hot
+            combo_indices_V: [codebook_size, xor_arity, num_atoms] one-hot
+            atoms_U: [num_atoms, rank] raw (not binary)
+            atoms_V: [num_atoms, rank] raw (not binary)
+        """
+        if not self._registered:
+            return
+
+        with torch.no_grad():
+            self._step_counter += 1
+
+            atoms_U_bin = torch.sign(atoms_U)
+            atoms_V_bin = torch.sign(atoms_V)
+
+            combo_flat_U = combo_indices_U.sum(dim=1)  # [K, A]
+            combo_flat_V = combo_indices_V.sum(dim=1)  # [K, A]
+
+            atom_active_U = (combo_flat_U.sum(dim=0) > 0).float()  # [A]
+            atom_active_V = (combo_flat_V.sum(dim=0) > 0).float()  # [A]
+
+            self._atom_hits_U += atom_active_U
+            self._atom_hits_V += atom_active_V
+
+            co_U = torch.einsum("a,b->ab", atom_active_U, atom_active_U)
+            co_V = torch.einsum("a,b->ab", atom_active_V, atom_active_V)
+            self._co_activation_U += co_U
+            self._co_activation_V += co_V
+
+            if self._step_counter.item() % self.resonance_interval == 0:
+                self._apply_resonance(atoms_U_bin, atoms_V_bin)
+
+    def _apply_resonance(self, atoms_U: torch.Tensor, atoms_V: torch.Tensor):
+        """Apply resonance: fix resonant pairs + replace dead atoms"""
+        layer = getattr(self, "_layer", None)
+        if layer is None:
+            return
+
+        with torch.no_grad():
+            dead_U = self._atom_hits_U < self.dead_threshold
+            dead_V = self._atom_hits_V < self.dead_threshold
+            total_U = self._atom_hits_U.sum() + 1e-10
+            total_V = self._atom_hits_V.sum() + 1e-10
+
+            dead_count = dead_U.sum().item() + dead_V.sum().item()
+
+            if dead_count == 0:
+                self._atom_hits_U.zero_()
+                self._atom_hits_V.zero_()
+                self._co_activation_U.zero_()
+                self._co_activation_V.zero_()
+                return
+
+            norm_co_U = self._co_activation_U / (total_U + 1e-10)
+            norm_co_V = self._co_activation_V / (total_V + 1e-10)
+
+            atom_norm_U = F.normalize(atoms_U, dim=1)
+            atom_norm_V = F.normalize(atoms_V, dim=1)
+            sim_U = atom_norm_U @ atom_norm_U.T
+            sim_V = atom_norm_V @ atom_norm_V.T
+
+            res_U = norm_co_U * (sim_U > self.similarity_threshold).float()
+            res_V = norm_co_V * (sim_V > self.similarity_threshold).float()
+
+            resonant_mask_U = res_U > self.resonance_threshold
+            resonant_mask_V = res_V > self.resonance_threshold
+
+            if resonant_mask_U.any():
+                i_idx, j_idx = resonant_mask_U.nonzero(as_tuple=True)
+                flip_count = 0
+                for i, j in zip(i_idx.tolist(), j_idx.tolist()):
+                    if i >= j:
+                        continue
+                    if sim_U[i, j] > self.similarity_threshold:
+                        bit_diff = (atoms_U[i] != atoms_U[j]).float()
+                        if bit_diff.sum() > 0:
+                            flip_bit = (
+                                bit_diff * torch.rand(self.rank, device=atoms_U.device)
+                            ).argmax()
+                            atoms_U[i, flip_bit] *= -1.0
+                            atoms_U[j, flip_bit] *= -1.0
+                            flip_count += 1
+                if flip_count > 0:
+                    layer.atoms_U.data.copy_(atoms_U)
+
+            if resonant_mask_V.any():
+                i_idx, j_idx = resonant_mask_V.nonzero(as_tuple=True)
+                flip_count = 0
+                for i, j in zip(i_idx.tolist(), j_idx.tolist()):
+                    if i >= j:
+                        continue
+                    if sim_V[i, j] > self.similarity_threshold:
+                        bit_diff = (atoms_V[i] != atoms_V[j]).float()
+                        if bit_diff.sum() > 0:
+                            flip_bit = (
+                                bit_diff * torch.rand(self.rank, device=atoms_V.device)
+                            ).argmax()
+                            atoms_V[i, flip_bit] *= -1.0
+                            atoms_V[j, flip_bit] *= -1.0
+                            flip_count += 1
+                if flip_count > 0:
+                    layer.atoms_V.data.copy_(atoms_V)
+
+            if dead_U.any():
+                live_mask_U = ~dead_U
+                live_indices_U = live_mask_U.nonzero(as_tuple=True)[0]
+                if len(live_indices_U) > 0:
+                    best_U = self._atom_hits_U.argmax()
+                    for d in dead_U.nonzero(as_tuple=True)[0]:
+                        mutant = atoms_U[best_U].clone()
+                        flip_mask = (
+                            torch.rand(self.rank, device=atoms_U.device)
+                            < self.mutation_strength
+                        )
+                        mutant[flip_mask] *= -1.0
+                        atoms_U[d] = mutant
+                    layer.atoms_U.data.copy_(atoms_U)
+
+            if dead_V.any():
+                live_mask_V = ~dead_V
+                live_indices_V = live_mask_V.nonzero(as_tuple=True)[0]
+                if len(live_indices_V) > 0:
+                    best_V = self._atom_hits_V.argmax()
+                    for d in dead_V.nonzero(as_tuple=True)[0]:
+                        mutant = atoms_V[best_V].clone()
+                        flip_mask = (
+                            torch.rand(self.rank, device=atoms_V.device)
+                            < self.mutation_strength
+                        )
+                        mutant[flip_mask] *= -1.0
+                        atoms_V[d] = mutant
+                    layer.atoms_V.data.copy_(atoms_V)
+
+            self._atom_hits_U.zero_()
+            self._atom_hits_V.zero_()
+            self._co_activation_U.zero_()
+            self._co_activation_V.zero_()
+
+    def get_stats(self) -> dict:
+        """Return current HAR statistics"""
+        total_U = self._atom_hits_U.sum().item()
+        total_V = self._atom_hits_V.sum().item()
+        return {
+            "har_registered": self._registered,
+            "har_step": self._step_counter.item(),
+            "dead_atoms_U": int((self._atom_hits_U < self.dead_threshold).sum().item()),
+            "dead_atoms_V": int((self._atom_hits_V < self.dead_threshold).sum().item()),
+            "resonance_events_U": int((self._co_activation_U > 0).sum().item() // 2),
+            "resonance_events_V": int((self._co_activation_V > 0).sum().item() // 2),
+            "top_atom_U": int(self._atom_hits_U.argmax().item()),
+            "top_atom_V": int(self._atom_hits_V.argmax().item()),
+        }
 
 
 class TRILIXLinear(nn.Module):
@@ -244,6 +458,7 @@ class TRILIXLinear(nn.Module):
         self.use_rvq = use_rvq
         self.use_sgh = use_sgh
         self.use_lcc = use_lcc
+        self.use_har = False
 
         # Temperature for soft XOR (anneals from 1.0 to 0.01)
         # ATC: 3 independent temperatures for cascade freezing
@@ -377,7 +592,19 @@ class TRILIXLinear(nn.Module):
         self.agi_phase = 0  # 0=disabled, 1=active
         self._cached_agi_loss = torch.tensor(0.0)
 
+        self.har = None
         self._init_parameters()
+
+    def enable_har(self, resonance_interval: int = 200):
+        """Enable Hebbian Atom Resonance (B4)"""
+        if self.har is None:
+            self.har = HebbianAtomResonance(
+                num_atoms=self.num_atoms,
+                rank=self.rank,
+                resonance_interval=resonance_interval,
+            )
+            self.har.register_with_layer(self)
+            self.use_har = True
 
     def _init_parameters(self):
         """Initialize parameters with principled schemes"""
@@ -833,6 +1060,19 @@ class TRILIXLinear(nn.Module):
         entropy_U = -(prob_U * torch.log(prob_U + 1e-10)).sum()
         entropy_V = -(prob_V * torch.log(prob_V + 1e-10)).sum()
         aux_losses["atom_entropy"] = (entropy_U + entropy_V) / 2.0
+
+        # B4: HAR observation — no gradients, runs after forward
+        if self.training and self.use_har and self.har is not None:
+            combo_idx_U = self._get_combo_indices_hard(self.combo_indices_U_logits)
+            combo_idx_V = self._get_combo_indices_hard(self.combo_indices_V_logits)
+            self.har.observe(combo_idx_U, combo_idx_V, self.atoms_U, self.atoms_V)
+            har_stats = self.har.get_stats()
+            aux_losses["har_dead_U"] = torch.tensor(
+                har_stats["dead_atoms_U"], dtype=torch.float32, device=output.device
+            )
+            aux_losses["har_dead_V"] = torch.tensor(
+                har_stats["dead_atoms_V"], dtype=torch.float32, device=output.device
+            )
 
         return output, aux_losses
 
