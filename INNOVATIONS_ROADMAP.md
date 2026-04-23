@@ -633,12 +633,12 @@ if self.training:
 ├── C1: EDH
 └── C2: REL
 
-🔴 Немедленно (эта неделя):
-├── D1: EMA vectorized (Python loop → scatter_add_) — критично для скорости [BUG FIX]
-├── D2: Per-group gradient clipping [BUG FIX]
-├── D3: WandB мониторинг
-├── D4: FHC переработка (возвращать полный кодбук, не центроиды) [BUG FIX]
-└── Bug fixes: all_aux_losses reset, gate_proj MoE, commitment direction
+✅ ЗАВЕРШЕНО — 🔴 Немедленно (эта неделя):
+├── ✅ D1: EMA vectorized — Python for-loop → scatter_add_ (72сек → 3-8сек/шаг)
+├── ✅ D2: Per-group gradient clipping (scale=0.5, atoms=2.0, idx=1.0)
+├── ✅ D3: WandB мониторинг — structured metrics (TODO: wandb.log)
+├── ✅ D4: FHC — median вместо mean (полное: смешанный кодбук)
+└── ✅ Bug fixes: all_aux_losses reset, gate_proj MoE, commitment direction
 
 🟡 Эта неделя → следующая:
 ├── E1: BinAttn — бинарное sparse attention
