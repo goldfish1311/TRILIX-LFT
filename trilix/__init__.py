@@ -16,11 +16,19 @@ from .layers import (
     ErrorDrivenHypernetwork,
     ReflectiveErrorLoop,
     TemperatureCascadeScheduler,
-    # E1-E4: Innovations from Claude
+    # E1-E4: Quality innovations
     BinaryApproximateAttention,
     ShadowDistillationHead,
     AdaptiveRankSchedule,
     ConfidenceWeightedLoss,
+    # F1-F3: Architecture innovations
+    HierarchicalPositionalAtomEncoding,
+    CrossLayerAtomSharing,
+    SpeculativeDecoder,
+    # G1-G3: Final form innovations
+    DiscreteSemanticAlgebra,
+    LatentDiffusionCodebook,
+    DynamicBPWAllocator,
 )
 from .model import TRILIXTransformer
 
@@ -41,4 +49,12 @@ __all__ = [
     "ShadowDistillationHead",
     "AdaptiveRankSchedule",
     "ConfidenceWeightedLoss",
+    # F1-F3
+    "HierarchicalPositionalAtomEncoding",
+    "CrossLayerAtomSharing",
+    "SpeculativeDecoder",
+    # G1-G3
+    "DiscreteSemanticAlgebra",
+    "LatentDiffusionCodebook",
+    "DynamicBPWAllocator",
 ]
