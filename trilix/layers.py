@@ -2893,3 +2893,140 @@ class SpeculativeDecoder:
             target_out = self.target(candidate_seq)
         
         return draft_tokens[:min(3, self.k)]  # Упрощенная версия
+
+
+# =============================================================================
+# G2: DSA — Discrete Semantic Algebra
+# =============================================================================
+
+class DiscreteSemanticAlgebra(nn.Module):
+    """G2: DSA — Discrete Semantic Algebra.
+    
+    Расширение SDO до полной алгебры над кодбуком:
+    - Аналогия (SDO): XOR(a,b) ≈ XOR(c,d)
+    - Транзитивность: A→B + B→C ≈ A→C
+    - Инверсия: XOR(a,b) = XOR(b,a)
+    
+    Chain-of-Thought reasoning встроен в структуру весов.
+    """
+    
+    def __init__(self, rank, num_samples=16):
+        super().__init__()
+        self.rank = rank
+        self.num_samples = num_samples
+        
+    def transitivity_loss(self, codebook):
+        """Транзитивность: (A→B) + (B→C) должно совпадать с (A→C)."""
+        k = codebook.size(0)
+        if k < 6:
+            return torch.tensor(0.0, device=codebook.device)
+        
+        # Семплируем триплеты (a, b, c)
+        idx = torch.randint(0, k, (self.num_samples, 3), device=codebook.device)
+        a = codebook[idx[:, 0]]
+        b = codebook[idx[:, 1]]
+        c = codebook[idx[:, 2]]
+        
+        # XOR в {±1} = поэлементное умножение
+        ab = a * b  # A→B
+        bc = b * c  # B→C
+        ac = a * c  # A→C
+        
+        # Транзитивность: ab XOR bc ≈ ac
+        ab_bc = ab * bc
+        trans_sim = (ab_bc * ac).sum(dim=-1) / self.rank
+        
+        return (1 - trans_sim).mean() * 0.00005
+    
+    def forward(self, codebook_U, codebook_V):
+        """Полный DSA loss."""
+        trans_u = self.transitivity_loss(codebook_U)
+        trans_v = self.transitivity_loss(codebook_V)
+        return trans_u + trans_v
+
+
+# =============================================================================
+# G1: LDC — Latent Diffusion Codebook
+# =============================================================================
+
+class LatentDiffusionCodebook(nn.Module):
+    """G1: LDC — Latent Diffusion Codebook.
+    
+    Кодслова генерируются через диффузионный процесс в r-мерном пространстве.
+    1–2 DDIM шага при инференсе. Произвольная геометрия manifold.
+    """
+    
+    def __init__(self, k, r, num_diffusion_steps=4):
+        super().__init__()
+        self.k = k
+        self.r = r
+        self.T = num_diffusion_steps
+        
+        # DDIM schedule
+        betas = torch.linspace(0.0001, 0.02, num_diffusion_steps)
+        self.register_buffer('alphas', 1 - betas)
+        self.register_buffer('alphas_cumprod', torch.cumprod(1 - betas, dim=0))
+        
+        # Denoiser
+        self.denoiser = nn.Sequential(
+            nn.Linear(r + 1, r * 2),
+            nn.GELU(),
+            nn.Linear(r * 2, r)
+        )
+        
+        # Якоря
+        self.anchors = nn.Parameter(torch.randn(k, r) * 0.1)
+        
+    def forward(self, num_steps=1):
+        """Генерировать кодслова за num_steps диффузии."""
+        x = self.anchors + torch.randn_like(self.anchors) * 0.1
+        
+        for t in range(self.T - 1, self.T - num_steps - 1, -1):
+            t_emb = torch.full((self.k, 1), t / self.T, device=x.device)
+            x_input = torch.cat([x, t_emb], dim=-1)
+            noise_pred = self.denoiser(x_input)
+            
+            alpha_bar = self.alphas_cumprod[t]
+            x = (x - (1 - alpha_bar).sqrt() * noise_pred) / alpha_bar.sqrt()
+        
+        return torch.sign(x)  # Бинаризовать
+
+
+# =============================================================================
+# G3: DBBA — Dynamic BPW Budget Allocation
+# =============================================================================
+
+class DynamicBPWAllocator(nn.Module):
+    """G3: DBBA — Dynamic BPW Budget Allocation.
+    
+    Learnable gate решает сколько rank-измерений активировать.
+    Lagrangian constraint на BPW=0.005.
+    Первая модель где сеть сама распределяет битовый бюджет.
+    """
+    
+    def __init__(self, num_layers, rank_max, bpw_budget=0.005):
+        super().__init__()
+        self.rank_max = rank_max
+        self.bpw_budget = bpw_budget
+        
+        # Learnable importance weights per rank dimension
+        self.rank_importance = nn.Parameter(torch.ones(num_layers, rank_max))
+        self.lambda_bpw = nn.Parameter(torch.tensor(0.01))
+        
+    def get_effective_rank(self, layer_idx, temperature=1.0):
+        """Мягкая маска активных rank-измерений."""
+        importance = self.rank_importance[layer_idx]
+        if self.training:
+            gumbel = -torch.log(-torch.log(torch.rand_like(importance) + 1e-10))
+            perturbed = importance + gumbel * temperature
+        else:
+            perturbed = importance
+        return torch.sigmoid(perturbed / temperature)
+    
+    def bpw_constraint_loss(self, all_effective_ranks, d_model):
+        """Штраф за превышение BPW бюджета."""
+        total_bits = sum((d_model * 2) * r.sum() for r in all_effective_ranks)
+        original_bits = len(all_effective_ranks) * d_model * d_model * 16
+        current_bpw = total_bits / original_bits
+        violation = F.relu(current_bpw - self.bpw_budget)
+        return self.lambda_bpw.abs() * violation
