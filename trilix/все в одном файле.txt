@@ -1,4 +1,211 @@
 """
+TRILIX Configuration
+"""
+
+from dataclasses import dataclass
+from typing import Optional, List
+
+
+@dataclass
+class TRILIXConfig:
+    """Configuration for TRILIX model"""
+
+    # Model architecture
+    hidden_size: int = 2048
+    num_hidden_layers: int = 24
+    num_attention_heads: int = 16
+    num_key_value_heads: int = 4
+    intermediate_size: int = 8192
+    vocab_size: int = 32000
+    max_position_embeddings: int = 4096
+
+    # TRILIX-specific compression parameters
+    rank_r: int = 100  # Latent factorization rank
+    codebook_k: int = 128  # Number of codewords in codebook
+    num_atoms_A: int = 32  # Number of XOR atoms
+    xor_arity_b: int = 3  # Number of atoms XORed for each codeword
+
+    # MoE-Codebook parameters (Level 4)
+    use_moe: bool = False  # Enable Mixture of Experts for codebook
+    num_experts: int = 4  # Number of codebook experts
+    moe_top_k: int = 2  # Top-k experts per token
+
+    # Innovation flags (from Claude)
+    use_saib: bool = False  # Soft Attention Index Blender
+    use_rvq: bool = False  # Residual Vector Quantization
+    use_sgh: bool = False  # Stochastic Group Hierarchy
+    use_lcc: bool = False  # Learned Codebook Compressor
+    use_fhc: bool = False  # B1.5: Flat Hierarchical Codebook (4×4=16 virtual experts)
+
+    # Scaling factors
+    scale_lr_multiplier: float = 10.0
+
+    # Training parameters
+    base_lr: float = 3e-4
+    min_lr: float = 3e-5
+    weight_decay: float = 0.1
+    warmup_steps: int = 2000
+    gradient_clip: float = 1.0
+
+    # Loss coefficients - FIXED: 0.25 explodes loss with 168 codebooks
+    commitment_beta: float = 0.0001
+    atom_diversity_weight: float = 0.01
+
+    # EMA for atoms
+    atom_ema_decay: float = 0.99
+
+    # Codebook restart threshold
+    codebook_restart_threshold: int = 1000
+
+    # Autoresearch compatibility
+    autoresearch_params: Optional[List[str]] = None
+
+    def __post_init__(self):
+        if self.autoresearch_params is None:
+            self.autoresearch_params = [
+                "rank_r",
+                "codebook_k",
+                "commitment_beta",
+                "scale_lr_multiplier",
+                "atom_diversity_weight",
+                "atom_ema_decay",
+            ]
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden_size // self.num_attention_heads
+
+    @property
+    def effective_bpw(self) -> float:
+        """Calculate approximate BPW for this config"""
+        d = self.hidden_size
+        r = self.rank_r
+        k = self.codebook_k
+        A = self.num_atoms_A
+        b = self.xor_arity_b
+        L = self.num_hidden_layers
+
+        # Indices storage
+        bits_indices = 2 * d * (k.bit_length() - 1)  # log2(k) bits per row
+
+        # Scales storage (BF16)
+        bits_scales = 2 * (d + d + r) * 16
+
+        # Codebook amortized (atoms + combinations)
+        bits_codebook_amortized = (A * r + k * b * A.bit_length()) / L
+
+        total_bits = bits_indices + bits_scales + bits_codebook_amortized
+        original_bits = d * d * 16
+
+        return total_bits / original_bits
+
+    @classmethod
+    def nano(cls) -> "TRILIXConfig":
+        """Nano config for RTX 3090 quick experiments"""
+        return cls(
+            hidden_size=1024,
+            num_hidden_layers=16,
+            num_attention_heads=16,
+            num_key_value_heads=4,
+            intermediate_size=4096,
+            rank_r=64,
+            codebook_k=64,
+            num_atoms_A=16,
+            xor_arity_b=2,
+        )
+
+    @classmethod
+    def small(cls) -> "TRILIXConfig":
+        """Small config for RTX 3090 serious training"""
+        return cls(
+            hidden_size=2048,
+            num_hidden_layers=24,
+            num_attention_heads=16,
+            num_key_value_heads=4,
+            intermediate_size=8192,
+            rank_r=100,
+            codebook_k=128,
+            num_atoms_A=32,
+            xor_arity_b=3,
+        )
+
+    @classmethod
+    def medium(cls) -> "TRILIXConfig":
+        """Medium config for inference on RTX 3090, training on A100"""
+        return cls(
+            hidden_size=4096,
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            intermediate_size=14336,
+            rank_r=200,
+            codebook_k=128,
+            num_atoms_A=32,
+            xor_arity_b=3,
+        )
+..............
+"""
+TRILIX-LFT: Triple-Level Indexed eXtreme Latent Factorized Transformer
+Native 0.04-0.09 BPW training from scratch on RTX 3090
+"""
+
+__version__ = "1.0.0"
+
+from .config import TRILIXConfig
+from .layers import (
+    TRILIXLinear,
+    HebbianAtomResonance,
+    DifferentiableAtomEvolver,
+    FlatHierarchicalMoE,
+    EmergentAgentSwarm,
+    BeliefGate,
+    ErrorDrivenHypernetwork,
+    ReflectiveErrorLoop,
+    TemperatureCascadeScheduler,
+    # E1-E4: Quality innovations
+    BinaryApproximateAttention,
+    ShadowDistillationHead,
+    AdaptiveRankSchedule,
+    ConfidenceWeightedLoss,
+    # F1-F3: Architecture innovations
+    HierarchicalPositionalAtomEncoding,
+    CrossLayerAtomSharing,
+    SpeculativeDecoder,
+    # G1-G3: Final form innovations
+    DiscreteSemanticAlgebra,
+    LatentDiffusionCodebook,
+    DynamicBPWAllocator,
+)
+from .model import TRILIXTransformer
+
+__all__ = [
+    "TRILIXConfig",
+    "TRILIXLinear",
+    "HebbianAtomResonance",
+    "DifferentiableAtomEvolver",
+    "FlatHierarchicalMoE",
+    "EmergentAgentSwarm",
+    "BeliefGate",
+    "ErrorDrivenHypernetwork",
+    "ReflectiveErrorLoop",
+    "TemperatureCascadeScheduler",
+    "TRILIXTransformer",
+    # E1-E4
+    "BinaryApproximateAttention",
+    "ShadowDistillationHead",
+    "AdaptiveRankSchedule",
+    "ConfidenceWeightedLoss",
+    # F1-F3
+    "HierarchicalPositionalAtomEncoding",
+    "CrossLayerAtomSharing",
+    "SpeculativeDecoder",
+    # G1-G3
+    "DiscreteSemanticAlgebra",
+    "LatentDiffusionCodebook",
+    "DynamicBPWAllocator",
+]
+..............
+"""
 TRILIX Linear Layer: Triple-Level Compression
 Level 1: Latent Factorization (W ≈ U · V^T)
 Level 2: Vector Quantization Codebook (indices → codewords)
@@ -2586,21 +2793,21 @@ class ReflectiveErrorLoop(nn.Module):
         }
 
 
+
 # =============================================================================
 # E1-E4: Innovations from Claude (integrated at end of file)
 # =============================================================================
 
-
 class BinaryApproximateAttention(nn.Module):
     """E1: BinAttn — бинарное sparse attention."""
-
+    
     def __init__(self, hidden_size, num_heads, head_dim, top_k_precise=0.1):
         super().__init__()
         self.hidden_size = hidden_size
-        self.num_heads = num_heads
+        self.num_heads = num_heads  
         self.head_dim = head_dim
         self.top_k_fraction = top_k_precise
-
+        
     def forward(self, q, k, v, mask=None):
         batch_size, num_heads, seq_len, head_dim = q.shape
         # Бинарное приближение
@@ -2611,16 +2818,10 @@ class BinaryApproximateAttention(nn.Module):
         k_precise = max(1, int(seq_len * self.top_k_fraction))
         topk_vals, topk_idx = torch.topk(approx_scores, k_precise, dim=-1)
         # Собираем K, V для top-k
-        k_gathered = torch.gather(
-            k, 2, topk_idx.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-        )
-        v_gathered = torch.gather(
-            v, 2, topk_idx.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-        )
+        k_gathered = torch.gather(k, 2, topk_idx.unsqueeze(-1).expand(-1, -1, -1, head_dim))
+        v_gathered = torch.gather(v, 2, topk_idx.unsqueeze(-1).expand(-1, -1, -1, head_dim))
         # Точные скоры
-        precise_scores = torch.matmul(
-            q.unsqueeze(-2), k_gathered.transpose(-2, -1)
-        ).squeeze(-2) / math.sqrt(head_dim)
+        precise_scores = torch.matmul(q.unsqueeze(-2), k_gathered.transpose(-2, -1)).squeeze(-2) / math.sqrt(head_dim)
         if mask is not None:
             mask_gathered = torch.gather(mask.expand(-1, -1, seq_len, -1), -1, topk_idx)
             precise_scores = precise_scores + mask_gathered
@@ -2631,7 +2832,7 @@ class BinaryApproximateAttention(nn.Module):
 
 class ShadowDistillationHead(nn.Module):
     """E2: OKDSH — Shadow Head for Knowledge Distillation."""
-
+    
     def __init__(self, hidden_size=256, vocab_size=32000, rank=64):
         super().__init__()
         self.hidden_size = hidden_size
@@ -2641,29 +2842,29 @@ class ShadowDistillationHead(nn.Module):
         self.shadow_head = nn.Linear(rank, vocab_size, bias=False)
         nn.init.normal_(self.shadow_proj.weight, std=0.02)
         nn.init.normal_(self.shadow_head.weight, std=0.02)
-
+        
     def forward(self, hidden_states):
         projected = self.shadow_proj(hidden_states)
         return self.shadow_head(projected)
-
+    
     def distillation_loss(self, trilix_logits, shadow_logits, temperature=2.0):
         trilix_soft = F.log_softmax(trilix_logits / temperature, dim=-1)
         shadow_soft = F.softmax(shadow_logits.detach() / temperature, dim=-1)
         return F.kl_div(
             trilix_soft.view(-1, self.vocab_size),
             shadow_soft.view(-1, self.vocab_size),
-            reduction="batchmean",
-        ) * (temperature**2)
+            reduction='batchmean'
+        ) * (temperature ** 2)
 
 
 class AdaptiveRankSchedule:
     """E3: ARL — Adaptive Rank per Layer."""
-
+    
     def __init__(self, num_layers, base_rank=100, min_factor=0.5, max_factor=2.0):
         self.num_layers = num_layers
         self.base_rank = base_rank
         self.rank_schedule = self._generate_schedule(min_factor, max_factor)
-
+        
     def _generate_schedule(self, min_factor, max_factor):
         ranks = []
         for i in range(self.num_layers):
@@ -2674,19 +2875,19 @@ class AdaptiveRankSchedule:
             rank = max(8, (rank // 8) * 8)
             ranks.append(rank)
         return ranks
-
+    
     def get_rank(self, layer_idx):
         return self.rank_schedule[layer_idx]
 
 
 class ConfidenceWeightedLoss(nn.Module):
     """E4: CWL — Confidence-Weighted Loss."""
-
+    
     def __init__(self, confidence_temp=2.0, min_weight=0.1):
         super().__init__()
         self.confidence_temp = confidence_temp
         self.min_weight = min_weight
-
+        
     def forward(self, logits, labels):
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
@@ -2697,7 +2898,7 @@ class ConfidenceWeightedLoss(nn.Module):
         ce_per_token = F.cross_entropy(
             shift_logits.view(-1, logits.size(-1)),
             shift_labels.view(-1),
-            reduction="none",
+            reduction='none'
         ).view_as(shift_labels)
         return (ce_per_token * weights).mean()
 
@@ -2706,49 +2907,43 @@ class ConfidenceWeightedLoss(nn.Module):
 # F2: CLAS — Cross-Layer Atom Sharing
 # =============================================================================
 
-
 class CrossLayerAtomSharing(nn.Module):
     """F2: Cross-Layer Atom Sharing (CLAS).
-
+    
     Разделение атомов на:
     - Глобальные (global_atoms): разделяемые всеми слоями одного типа
     - Локальные (local_atoms): уникальные для каждого слоя
-
+    
     Экономия: 3.7× меньше атомных параметров.
     Глобальные атомы конвергируют в 3–5× быстрее (сигнал от всей сети).
     """
-
+    
     def __init__(self, num_global_atoms, num_local_atoms, rank, num_layers):
         super().__init__()
         self.num_global_atoms = num_global_atoms
         self.num_local_atoms = num_local_atoms
         self.rank = rank
         self.num_layers = num_layers
-
+        
         # Глобальные атомы: [num_global_atoms, rank] — SHARED
         self.global_atoms = nn.Parameter(torch.randn(num_global_atoms, rank) * 0.01)
-
+        
         # Локальные атомы: [num_layers, num_local_atoms, rank] — per-layer
         self.local_atoms = nn.Parameter(
             torch.randn(num_layers, num_local_atoms, rank) * 0.01
         )
-
+        
     def get_atoms(self, layer_idx):
         """Получить все атомы для слоя (global + local)."""
         # Concatenate global and local for this layer
         local_for_layer = self.local_atoms[layer_idx]  # [num_local_atoms, rank]
         all_atoms = torch.cat([self.global_atoms, local_for_layer], dim=0)
         return all_atoms  # [num_global_atoms + num_local_atoms, rank]
-
+    
     def get_stats(self):
         """Статистика параметров."""
-        total_params = (
-            self.num_global_atoms * self.rank
-            + self.num_local_atoms * self.rank * self.num_layers
-        )
-        without_sharing = (
-            (self.num_global_atoms + self.num_local_atoms) * self.rank * self.num_layers
-        )
+        total_params = self.num_global_atoms * self.rank + self.num_local_atoms * self.rank * self.num_layers
+        without_sharing = (self.num_global_atoms + self.num_local_atoms) * self.rank * self.num_layers
         return {
             "total_atoms": self.num_global_atoms + self.num_local_atoms,
             "global_atoms": self.num_global_atoms,
@@ -2762,26 +2957,25 @@ class CrossLayerAtomSharing(nn.Module):
 # F1: HPAE — Hierarchical Positional Atom Encoding
 # =============================================================================
 
-
 class HierarchicalPositionalAtomEncoding(nn.Module):
     """F1: HPAE — Hierarchical Positional Atom Encoding.
-
+    
     Встраивает позиционную информацию прямо в атомы.
     Часть атомов специализируется на позиционных паттернах (sin/cos).
     """
-
+    
     def __init__(self, num_atoms, rank, max_seq_len=4096):
         super().__init__()
         self.num_atoms = num_atoms
         self.rank = rank
         self.max_seq_len = max_seq_len
-
+        
         n_pos = rank // 3
         n_content = rank - 2 * n_pos
-
+        
         # Позиционные атомы: инициализируются как дискретизированные Fourier
         self.pos_atom_init = self._init_positional_atoms(n_pos)
-
+        
     def _init_positional_atoms(self, n_pos):
         """Инициализация позиционных атомов как sin/cos компоненты."""
         atoms = []
@@ -2798,19 +2992,18 @@ class HierarchicalPositionalAtomEncoding(nn.Module):
 # F3: SpecDec — Speculative Decoding
 # =============================================================================
 
-
 class SpeculativeDecoder:
     """F3: SpecDec — Speculative Decoding.
-
+    
     Nano TRILIX генерирует 5 черновиков → Main TRILIX проверяет параллельно.
     Throughput: 65 tok/s → 200–250 tok/s.
     """
-
+    
     def __init__(self, draft_model, target_model, num_speculative=5):
         self.draft = draft_model
         self.target = target_model
         self.k = num_speculative
-
+        
     def generate_step(self, input_ids):
         # 1. Draft: генерируем k токенов
         draft_tokens = []
@@ -2824,17 +3017,13 @@ class SpeculativeDecoder:
             draft_tokens.append(next_tok)
             draft_probs.append(draft_prob)
             x = torch.cat([x, next_tok.unsqueeze(-1)], dim=-1)
-
+        
         # 2. Target: проверяем все k токенов ПАРАЛЛЕЛЬНО
-        candidate_seq = torch.cat(
-            [input_ids, torch.stack(draft_tokens, dim=-1)], dim=-1
-        )
+        candidate_seq = torch.cat([input_ids, torch.stack(draft_tokens, dim=-1)], dim=-1)
         with torch.no_grad():
             target_out = self.target(candidate_seq)
-            target_probs = F.softmax(
-                target_out["logits"][:, -self.k - 1 : -1, :], dim=-1
-            )
-
+            target_probs = F.softmax(target_out["logits"][:, -self.k-1:-1, :], dim=-1)
+        
         # 3. Speculative sampling
         accepted = []
         for i in range(self.k):
@@ -2845,7 +3034,7 @@ class SpeculativeDecoder:
                 accepted.append(draft_tokens[i])
             else:
                 break
-
+        
         return accepted
 
 
@@ -2853,19 +3042,18 @@ class SpeculativeDecoder:
 # F1: HPAE — Hierarchical Positional Atom Encoding
 # =============================================================================
 
-
 class HierarchicalPositionalAtomEncoding(nn.Module):
     """F1: HPAE — Hierarchical Positional Atom Encoding.
-
+    
     Встраивает позиционную информацию прямо в атомы.
     """
-
+    
     def __init__(self, num_atoms, rank, max_seq_len=4096):
         super().__init__()
         self.num_atoms = num_atoms
         self.rank = rank
         self.max_seq_len = max_seq_len
-
+        
     def _init_positional_atoms(self, n_pos):
         """Инициализация позиционных атомов как sin/cos компоненты."""
         atoms = []
@@ -2882,19 +3070,18 @@ class HierarchicalPositionalAtomEncoding(nn.Module):
 # F3: SpecDec — Speculative Decoding
 # =============================================================================
 
-
 class SpeculativeDecoder:
     """F3: SpecDec — Speculative Decoding.
-
+    
     Nano TRILIX генерирует k черновиков → Main TRILIX проверяет параллельно.
     Throughput: 65 tok/s → 200–250 tok/s.
     """
-
+    
     def __init__(self, draft_model, target_model, num_speculative=5):
         self.draft = draft_model
         self.target = target_model
         self.k = num_speculative
-
+        
     def generate_step(self, input_ids):
         # Draft: генерируем k токенов
         draft_tokens = []
@@ -2906,61 +3093,58 @@ class SpeculativeDecoder:
                 next_tok = draft_prob.argmax(dim=-1)
             draft_tokens.append(next_tok)
             x = torch.cat([x, next_tok.unsqueeze(-1)], dim=-1)
-
+        
         # Target: проверяем все k параллельно
-        candidate_seq = torch.cat(
-            [input_ids, torch.stack(draft_tokens, dim=-1)], dim=-1
-        )
+        candidate_seq = torch.cat([input_ids, torch.stack(draft_tokens, dim=-1)], dim=-1)
         with torch.no_grad():
             target_out = self.target(candidate_seq)
-
-        return draft_tokens[: min(3, self.k)]  # Упрощенная версия
+        
+        return draft_tokens[:min(3, self.k)]  # Упрощенная версия
 
 
 # =============================================================================
 # G2: DSA — Discrete Semantic Algebra
 # =============================================================================
 
-
 class DiscreteSemanticAlgebra(nn.Module):
     """G2: DSA — Discrete Semantic Algebra.
-
+    
     Расширение SDO до полной алгебры над кодбуком:
     - Аналогия (SDO): XOR(a,b) ≈ XOR(c,d)
     - Транзитивность: A→B + B→C ≈ A→C
     - Инверсия: XOR(a,b) = XOR(b,a)
-
+    
     Chain-of-Thought reasoning встроен в структуру весов.
     """
-
+    
     def __init__(self, rank, num_samples=16):
         super().__init__()
         self.rank = rank
         self.num_samples = num_samples
-
+        
     def transitivity_loss(self, codebook):
         """Транзитивность: (A→B) + (B→C) должно совпадать с (A→C)."""
         k = codebook.size(0)
         if k < 6:
             return torch.tensor(0.0, device=codebook.device)
-
+        
         # Семплируем триплеты (a, b, c)
         idx = torch.randint(0, k, (self.num_samples, 3), device=codebook.device)
         a = codebook[idx[:, 0]]
         b = codebook[idx[:, 1]]
         c = codebook[idx[:, 2]]
-
+        
         # XOR в {±1} = поэлементное умножение
         ab = a * b  # A→B
         bc = b * c  # B→C
         ac = a * c  # A→C
-
+        
         # Транзитивность: ab XOR bc ≈ ac
         ab_bc = ab * bc
         trans_sim = (ab_bc * ac).sum(dim=-1) / self.rank
-
+        
         return (1 - trans_sim).mean() * 0.00005
-
+    
     def forward(self, codebook_U, codebook_V):
         """Полный DSA loss."""
         trans_u = self.transitivity_loss(codebook_U)
@@ -2972,45 +3156,46 @@ class DiscreteSemanticAlgebra(nn.Module):
 # G1: LDC — Latent Diffusion Codebook
 # =============================================================================
 
-
 class LatentDiffusionCodebook(nn.Module):
     """G1: LDC — Latent Diffusion Codebook.
-
+    
     Кодслова генерируются через диффузионный процесс в r-мерном пространстве.
     1–2 DDIM шага при инференсе. Произвольная геометрия manifold.
     """
-
+    
     def __init__(self, k, r, num_diffusion_steps=4):
         super().__init__()
         self.k = k
         self.r = r
         self.T = num_diffusion_steps
-
+        
         # DDIM schedule
         betas = torch.linspace(0.0001, 0.02, num_diffusion_steps)
-        self.register_buffer("alphas", 1 - betas)
-        self.register_buffer("alphas_cumprod", torch.cumprod(1 - betas, dim=0))
-
+        self.register_buffer('alphas', 1 - betas)
+        self.register_buffer('alphas_cumprod', torch.cumprod(1 - betas, dim=0))
+        
         # Denoiser
         self.denoiser = nn.Sequential(
-            nn.Linear(r + 1, r * 2), nn.GELU(), nn.Linear(r * 2, r)
+            nn.Linear(r + 1, r * 2),
+            nn.GELU(),
+            nn.Linear(r * 2, r)
         )
-
+        
         # Якоря
         self.anchors = nn.Parameter(torch.randn(k, r) * 0.1)
-
+        
     def forward(self, num_steps=1):
         """Генерировать кодслова за num_steps диффузии."""
         x = self.anchors + torch.randn_like(self.anchors) * 0.1
-
+        
         for t in range(self.T - 1, self.T - num_steps - 1, -1):
             t_emb = torch.full((self.k, 1), t / self.T, device=x.device)
             x_input = torch.cat([x, t_emb], dim=-1)
             noise_pred = self.denoiser(x_input)
-
+            
             alpha_bar = self.alphas_cumprod[t]
             x = (x - (1 - alpha_bar).sqrt() * noise_pred) / alpha_bar.sqrt()
-
+        
         return torch.sign(x)  # Бинаризовать
 
 
@@ -3018,24 +3203,23 @@ class LatentDiffusionCodebook(nn.Module):
 # G3: DBBA — Dynamic BPW Budget Allocation
 # =============================================================================
 
-
 class DynamicBPWAllocator(nn.Module):
     """G3: DBBA — Dynamic BPW Budget Allocation.
-
+    
     Learnable gate решает сколько rank-измерений активировать.
     Lagrangian constraint на BPW=0.005.
     Первая модель где сеть сама распределяет битовый бюджет.
     """
-
+    
     def __init__(self, num_layers, rank_max, bpw_budget=0.005):
         super().__init__()
         self.rank_max = rank_max
         self.bpw_budget = bpw_budget
-
+        
         # Learnable importance weights per rank dimension
         self.rank_importance = nn.Parameter(torch.ones(num_layers, rank_max))
         self.lambda_bpw = nn.Parameter(torch.tensor(0.01))
-
+        
     def get_effective_rank(self, layer_idx, temperature=1.0):
         """Мягкая маска активных rank-измерений."""
         importance = self.rank_importance[layer_idx]
@@ -3045,7 +3229,7 @@ class DynamicBPWAllocator(nn.Module):
         else:
             perturbed = importance
         return torch.sigmoid(perturbed / temperature)
-
+    
     def bpw_constraint_loss(self, all_effective_ranks, d_model):
         """Штраф за превышение BPW бюджета."""
         total_bits = sum((d_model * 2) * r.sum() for r in all_effective_ranks)
@@ -3053,457 +3237,678 @@ class DynamicBPWAllocator(nn.Module):
         current_bpw = total_bits / original_bits
         violation = F.relu(current_bpw - self.bpw_budget)
         return self.lambda_bpw.abs() * violation
-
-
-# =============================================================================
-# H1-H5: Critical Second-Wave Innovations (Muon, Sequence Packing, AGI Warmup, Cosine Loss, Checkpoint Stats)
-# =============================================================================
-
-
-class MuonOptimizer:
-    """H1: Muon Optimizer for TRILIX.
-
-    Newton-Schulz orthogonalization for matrix parameters.
-    Best for: idx_U_logits, idx_V_logits (binary indices "voting").
-    Gives 1.5-2x faster convergence vs AdamW for matrix params.
-
-    Reference: Keller Jordan (2024) — Newton-Schulz iterations
-    for orthogonal matrix updates.
-    """
-
-    def __init__(
-        self, params, lr=3e-4, momentum=0.95, weight_decay=0.01, nesterov=True
-    ):
-        """Initialize Muon optimizer.
-
-        Args:
-            params: iterable of parameters to optimize (should be 2D matrix params)
-            lr: learning rate
-            momentum: momentum coefficient
-            weight_decay: weight decay (L2 regularization)
-            nesterov: use Nesterov momentum
-        """
-        self.params = list(params)
-        self.lr = lr
-        self.momentum = momentum
-        self.weight_decay = weight_decay
-        self.nesterov = nesterov
-
-        # State for momentum
-        self.state = {}
-        for p in self.params:
-            if p.requires_grad:
-                self.state[p] = {"momentum_buffer": torch.zeros_like(p)}
-
-    def zero_grad(self):
-        """Zero gradients."""
-        for p in self.params:
-            if p.grad is not None:
-                p.grad.detach_()
-                p.grad.zero_()
-
-    def _newton_schulz(self, G, steps=5, eps=1e-8):
-        """Newton-Schulz iteration for orthogonalization.
-
-        Finds closest orthogonal matrix to G via iteration:
-        X_{k+1} = 1.5 * X_k - 0.5 * X_k @ X_k^T @ X_k
-
-        Converges to X such that X^T X = I (orthogonal).
-        """
-        # Normalize for numerical stability
-        a = G.norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
-        X = G / a
-
-        for _ in range(steps):
-            # Newton-Schulz step
-            X = 1.5 * X - 0.5 * X @ X.transpose(-2, -1) @ X
-
-        return X * a
-
-    def step(self):
-        """Perform a single optimization step."""
-        for p in self.params:
-            if not p.requires_grad or p.grad is None:
-                continue
-
-            grad = p.grad.data
-
-            # Weight decay (decoupled)
-            if self.weight_decay != 0:
-                p.data.mul_(1 - self.lr * self.weight_decay)
-
-            # Momentum
-            state = self.state[p]
-            buf = state["momentum_buffer"]
-            buf.mul_(self.momentum).add_(grad)
-
-            if self.nesterov:
-                grad = grad + self.momentum * buf
-            else:
-                grad = buf
-
-            # Newton-Schulz orthogonalization for 2D params (matrix)
-            if grad.dim() == 2:
-                grad_orthogonal = self._newton_schulz(grad)
-            else:
-                grad_orthogonal = grad
-
-            # Update
-            p.data.add_(grad_orthogonal, alpha=-self.lr)
-
-    def state_dict(self):
-        """Return state dict."""
-        return {
-            "state": {
-                p: {k: v.clone() for k, v in s.items()} for p, s in self.state.items()
-            },
-            "lr": self.lr,
-            "momentum": self.momentum,
-            "weight_decay": self.weight_decay,
-            "nesterov": self.nesterov,
-        }
-
-    def load_state_dict(self, state_dict):
-        """Load state dict."""
-        self.lr = state_dict["lr"]
-        self.momentum = state_dict["momentum"]
-        self.weight_decay = state_dict["weight_decay"]
-        self.nesterov = state_dict["nesterov"]
-        for p, s in state_dict["state"].items():
-            self.state[p] = s
-
-
-class SequencePacker:
-    """H2: Sequence Packing — 256 → 2048 effective context length.
-
-    Eliminates padding waste by packing multiple documents into single batch.
-    Uses document mask to prevent cross-document attention.
-
-    With padding: effective batch = 0.4 (60% waste)
-    With packing: effective batch = 1.0, seq_len = 2048 (8× context!)
-
-    Key to reasoning (proven in GPT-4, Gemini).
-    """
-
-    def __init__(self, max_seq_len=2048, pad_token_id=0):
-        self.max_seq_len = max_seq_len
-        self.pad_token_id = pad_token_id
-
-    def pack_sequences(self, sequences):
-        """Pack multiple sequences into single packed sequence with document mask.
-
-        Args:
-            sequences: list of tensors [seq_len_i], variable lengths
-
-        Returns:
-            packed_ids: [1, max_seq_len] packed token ids
-            doc_mask: [1, max_seq_len, max_seq_len] document attention mask
-                      True = can attend, False = cannot attend (different docs)
-        """
-        device = sequences[0].device if sequences else torch.device("cpu")
-
-        packed_ids = []
-        doc_starts = [0]  # Start indices of each document
-        current_pos = 0
-
-        for seq in sequences:
-            seq_len = seq.size(0)
-            if current_pos + seq_len > self.max_seq_len:
-                break  # Don't exceed max length
-
-            packed_ids.append(seq)
-            current_pos += seq_len
-            doc_starts.append(current_pos)
-
-        # Pad remaining
-        if current_pos < self.max_seq_len:
-            padding = torch.full(
-                (self.max_seq_len - current_pos,),
-                self.pad_token_id,
-                device=device,
-                dtype=sequences[0].dtype,
-            )
-            packed_ids.append(padding)
-
-        packed_ids = torch.cat(packed_ids).unsqueeze(0)  # [1, max_seq_len]
-
-        # Create document mask (causal + document boundaries)
-        doc_mask = self._create_doc_mask(doc_starts[:-1], current_pos, device)
-
-        return packed_ids, doc_mask
-
-    def _create_doc_mask(self, doc_starts, total_len, device):
-        """Create document mask: tokens can only attend within their document.
-
-        Args:
-            doc_starts: list of start indices for each document
-            total_len: total sequence length
-            device: torch device
-
-        Returns:
-            mask: [1, total_len, total_len] boolean tensor
-                  True = can attend, False = cannot attend
-        """
-        mask = torch.zeros(1, total_len, total_len, dtype=torch.bool, device=device)
-
-        for i, start in enumerate(doc_starts):
-            end = doc_starts[i + 1] if i + 1 < len(doc_starts) else total_len
-
-            # Within document: causal mask
-            for pos in range(start, end):
-                mask[0, pos, start : pos + 1] = (
-                    True  # Can attend to doc start through current pos
-                )
-
-        # Pad to max_seq_len
-        if total_len < self.max_seq_len:
-            pad_mask = torch.zeros(
-                1,
-                total_len,
-                self.max_seq_len - total_len,
-                dtype=torch.bool,
-                device=device,
-            )
-            mask = torch.cat([mask, pad_mask], dim=-1)
-
-            pad_mask_2 = torch.zeros(
-                1,
-                self.max_seq_len - total_len,
-                self.max_seq_len,
-                dtype=torch.bool,
-                device=device,
-            )
-            mask = torch.cat([mask, pad_mask_2], dim=1)
-
-        return mask
-
-    def unpack_logits(self, logits, doc_starts):
-        """Unpack packed logits back to individual sequence logits.
-
-        Args:
-            logits: [1, max_seq_len, vocab_size] packed logits
-            doc_starts: list of document start indices
-
-        Returns:
-            list of [seq_len_i, vocab_size] unpacked logits
-        """
-        unpacked = []
-        for i, start in enumerate(doc_starts[:-1]):
-            end = doc_starts[i + 1]
-            unpacked.append(logits[0, start:end])
-        return unpacked
-
-
-class CosineLoss:
-    """H3: Cosine Loss for {±1} codebook space.
-
-    MSE is blind to scale: (1,1,1) and (2,2,2) have same loss.
-    Cosine distinguishes direction from magnitude — exactly what's needed for codebook.
-
-    Scale is controlled by row/col_scale, codebook encodes DIRECTION.
-    Expected improvement: 40-60% better AGI loss.
-    """
-
-    def __init__(self, temperature=0.07):
-        """Initialize CosineLoss.
-
-        Args:
-            temperature: temperature for softening cosine similarity
-        """
-        self.temperature = temperature
-
-    def __call__(self, pred, target, reduction="mean"):
-        """Compute cosine loss.
-
-        Args:
-            pred: predicted values [..., dim]
-            target: target values [..., dim]
-            reduction: 'mean', 'sum', or 'none'
-
-        Returns:
-            loss: scalar or tensor depending on reduction
-        """
-        # Normalize to unit sphere
-        pred_norm = F.normalize(pred, dim=-1, eps=1e-8)
-        target_norm = F.normalize(target, dim=-1, eps=1e-8)
-
-        # Cosine similarity in [-1, 1]
-        cosine_sim = (pred_norm * target_norm).sum(dim=-1)
-
-        # Convert to loss: 1 - similarity (in [0, 2])
-        loss = (1 - cosine_sim) / self.temperature
-
-        if reduction == "mean":
-            return loss.mean()
-        elif reduction == "sum":
-            return loss.sum()
-        else:
-            return loss
-
-
-class AGIWarmup:
-    """H4: AGI Warmup — linear 0→0.1 over first N steps.
-
-    Hard switch at step 300 creates loss spike (NaN risk).
-    Linear warmup eliminates this instability.
-
-    Critical for stable training with AGI phase.
-    """
-
-    def __init__(self, warmup_steps=300, target_weight=0.1):
-        """Initialize AGI Warmup scheduler.
-
-        Args:
-            warmup_steps: number of steps to reach target_weight
-            target_weight: final AGI loss weight
-        """
-        self.warmup_steps = warmup_steps
-        self.target_weight = target_weight
-
-    def get_weight(self, step):
-        """Get current AGI weight for step.
-
-        Args:
-            step: current training step
-
-        Returns:
-            weight: current AGI loss weight (linear interpolation)
-        """
-        if step >= self.warmup_steps:
-            return self.target_weight
-        return self.target_weight * (step / self.warmup_steps)
-
-
-class CodebookStatsTracker:
-    """H5: Checkpoint Codebook Statistics.
-
-    Tracks top-3 checkpoints by codebook quality metrics.
-    Production requirement: resume from best checkpoint after crash.
-
-    Metrics tracked:
-    - codebook_diversity: average pairwise distance between codewords
-    - codebook_usage: distribution of codeword usage
-    - commitment_loss: VQ commitment quality
-    """
-
-    def __init__(self, keep_top_k=3):
-        """Initialize CodebookStatsTracker.
-
-        Args:
-            keep_top_k: number of top checkpoints to track
-        """
-        self.keep_top_k = keep_top_k
-        self.checkpoint_stats = []  # List of (score, step, path)
-
-    def compute_codebook_stats(self, model):
-        """Compute codebook statistics for model.
-
-        Args:
-            model: TRILIX model with codebooks
-
-        Returns:
-            dict with codebook metrics
-        """
-        stats = {
-            "codebook_diversity": 0.0,
-            "codebook_usage_entropy": 0.0,
-            "num_codebooks": 0,
-        }
-
-        # Collect all codebooks from TRILIXLinear layers
-        codebooks = []
-        for module in model.modules():
-            if hasattr(module, "codebook_U") and hasattr(module, "codebook_V"):
-                # Get codewords
-                cb_U = module.get_codewords_U()
-                cb_V = module.get_codewords_V()
-                codebooks.append(cb_U)
-                codebooks.append(cb_V)
-
-        if not codebooks:
-            return stats
-
-        # Compute diversity: average pairwise Hamming distance
-        total_diversity = 0.0
-        for cb in codebooks:
-            k = cb.size(0)
-            if k < 2:
-                continue
-
-            # Binary codewords: compute Hamming distance
-            cb_bin = torch.sign(cb) if cb.abs().max() > 1.1 else cb
-            distances = []
-            for i in range(min(k, 32)):  # Sample for efficiency
-                for j in range(i + 1, min(k, 32)):
-                    dist = (cb_bin[i] != cb_bin[j]).float().mean()
-                    distances.append(dist.item())
-
-            if distances:
-                total_diversity += sum(distances) / len(distances)
-                stats["num_codebooks"] += 1
-
-        if stats["num_codebooks"] > 0:
-            stats["codebook_diversity"] = total_diversity / stats["num_codebooks"]
-
-        return stats
-
-    def compute_score(self, stats):
-        """Compute overall quality score from stats.
-
-        Args:
-            stats: dict from compute_codebook_stats
-
-        Returns:
-            score: higher is better
-        """
-        # Diversity is key metric (higher = more expressive codebook)
-        return stats.get("codebook_diversity", 0.0)
-
-    def update(self, step, model, checkpoint_path):
-        """Update tracker with new checkpoint.
-
-        Args:
-            step: training step
-            model: current model
-            checkpoint_path: path where checkpoint was saved
-        """
-        stats = self.compute_codebook_stats(model)
-        score = self.compute_score(stats)
-
-        self.checkpoint_stats.append(
-            {
-                "score": score,
-                "step": step,
-                "path": checkpoint_path,
-                "stats": stats,
-            }
+.............
+"""
+TRILIX Transformer Model
+Full transformer with TRILIX linear layers
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from typing import Optional, Tuple, Dict
+
+from .layers import (
+    TRILIXLinear,
+    WorldModelHead,
+    BeliefGate,
+    SoulCodebook,
+    SymbolicDiffLoss,
+    STEBinary,
+    EmergentAgentSwarm,
+    ErrorDrivenHypernetwork,
+    ReflectiveErrorLoop,
+)
+from .config import TRILIXConfig
+
+
+class TRILIXRMSNorm(nn.Module):
+    """RMSNorm in FP32 for stability"""
+
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Always compute in FP32
+        orig_dtype = x.dtype
+        x_fp32 = x.float()
+        rms = torch.sqrt(torch.mean(x_fp32**2, dim=-1, keepdim=True) + self.eps)
+        x_norm = x_fp32 / rms
+        return (x_norm * self.weight).to(orig_dtype)
+
+
+def get_trilix_kwargs(config: TRILIXConfig) -> Dict:
+    """Get common kwargs for TRILIXLinear from config"""
+    return {
+        "rank": config.rank_r,
+        "codebook_size": config.codebook_k,
+        "num_atoms": config.num_atoms_A,
+        "xor_arity": config.xor_arity_b,
+        "commitment_beta": config.commitment_beta,
+        "atom_ema_decay": config.atom_ema_decay,
+        "use_moe": config.use_moe,
+        "num_experts": config.num_experts if config.use_moe else 4,
+        "moe_top_k": config.moe_top_k if config.use_moe else 2,
+        "use_saib": config.use_saib,
+        "use_rvq": config.use_rvq,
+        "use_sgh": config.use_sgh,
+        "use_lcc": config.use_lcc,
+        "use_fhc": config.use_fhc,
+    }
+
+
+class TRILIXAttention(nn.Module):
+    """Grouped Query Attention with TRILIX linear layers"""
+
+    def __init__(self, config: TRILIXConfig):
+        super().__init__()
+
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
+
+        trilix_kwargs = get_trilix_kwargs(config)
+
+        self.q_proj = TRILIXLinear(
+            config.hidden_size, self.num_heads * self.head_dim, **trilix_kwargs
         )
 
-        # Keep only top-k
-        self.checkpoint_stats.sort(key=lambda x: x["score"], reverse=True)
-        self.checkpoint_stats = self.checkpoint_stats[: self.keep_top_k]
+        self.k_proj = TRILIXLinear(
+            config.hidden_size, self.num_kv_heads * self.head_dim, **trilix_kwargs
+        )
 
-    def get_best_checkpoint(self):
-        """Get path to best checkpoint.
+        self.v_proj = TRILIXLinear(
+            config.hidden_size, self.num_kv_heads * self.head_dim, **trilix_kwargs
+        )
+
+        self.o_proj = TRILIXLinear(
+            self.num_heads * self.head_dim, config.hidden_size, **trilix_kwargs
+        )
+
+        # RoPE
+        self.rope_theta = 500000.0
+        self._init_rope()
+
+    def _init_rope(self):
+        """Initialize RoPE frequencies"""
+        inv_freq = 1.0 / (
+            self.rope_theta
+            ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim)
+        )
+        self.register_buffer("inv_freq", inv_freq)
+
+    def _apply_rope(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """Apply Rotary Positional Embedding"""
+        # x: [batch, num_heads, seq_len, head_dim]
+        t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)  # [seq_len, head_dim//2]
+
+        # Duplicate for full head_dim
+        emb = torch.cat([freqs, freqs], dim=-1)  # [seq_len, head_dim]
+
+        cos = emb.cos()[None, None, :, :]  # [1, 1, seq_len, head_dim]
+        sin = emb.sin()[None, None, :, :]
+
+        # Rotate
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        x_rotated = torch.stack([-x2, x1], dim=-1).flatten(-2)
+
+        return x * cos + x_rotated * sin
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple], Dict]:
+        """
+        Forward pass with TRILIX compression
 
         Returns:
-            path: str or None if no checkpoints tracked
+            hidden_states: [batch, seq_len, hidden_size]
+            past_key_value: cached KV for generation
+            aux_losses: dict with commitment losses
         """
-        if not self.checkpoint_stats:
-            return None
-        return self.checkpoint_stats[0]["path"]
+        batch_size, seq_len, _ = hidden_states.shape
 
-    def summary(self):
-        """Get summary of tracked checkpoints.
+        aux_losses = {}
 
-        Returns:
-            str: human-readable summary
+        # Project with TRILIX layers
+        q, q_losses = self.q_proj(hidden_states)
+        k, k_losses = self.k_proj(hidden_states)
+        v, v_losses = self.v_proj(hidden_states)
+
+        for k_loss in [q_losses, k_losses, v_losses]:
+            for key, val in k_loss.items():
+                aux_losses[f"attn_{key}"] = aux_losses.get(f"attn_{key}", 0) + val
+
+        # Reshape for attention
+        # Q: [batch, seq_len, num_heads * head_dim] -> [batch, num_heads, seq_len, head_dim]
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(
+            1, 2
+        )
+        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(
+            1, 2
+        )
+
+        # Apply RoPE
+        q = self._apply_rope(q, seq_len)
+        k = self._apply_rope(k, seq_len)
+
+        # Handle KV cache for generation
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+
+        present_key_value = (k, v) if past_key_value is not None else None
+
+        # Group query attention: repeat KV heads
+        if self.num_kv_groups > 1:
+            k = k.repeat_interleave(self.num_kv_groups, dim=1)
+            v = v.repeat_interleave(self.num_kv_groups, dim=1)
+
+        # Attention scores
+        scale = 1.0 / math.sqrt(self.head_dim)
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+
+        if attention_mask is not None:
+            attn_scores = attn_scores + attention_mask
+
+        attn_probs = F.softmax(attn_scores, dim=-1)
+
+        # Attention output
+        attn_output = torch.matmul(
+            attn_probs, v
+        )  # [batch, num_heads, seq_len, head_dim]
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(batch_size, seq_len, -1)
+
+        # Output projection
+        output, o_losses = self.o_proj(attn_output)
+        for key, val in o_losses.items():
+            aux_losses[f"attn_o_{key}"] = val
+
+        return output, present_key_value, aux_losses
+
+
+class TRILIXSwiGLU(nn.Module):
+    """SwiGLU FFN with TRILIX layers"""
+
+    def __init__(self, config: TRILIXConfig):
+        super().__init__()
+
+        self.gate_proj = TRILIXLinear(
+            config.hidden_size,
+            config.intermediate_size,
+            rank=config.rank_r,
+            codebook_size=config.codebook_k,
+            num_atoms=config.num_atoms_A,
+            xor_arity=config.xor_arity_b,
+            commitment_beta=config.commitment_beta,
+            atom_ema_decay=config.atom_ema_decay,
+            use_moe=config.use_moe,
+            num_experts=config.num_experts if config.use_moe else 4,
+            moe_top_k=config.moe_top_k if config.use_moe else 2,
+        )
+
+        self.up_proj = TRILIXLinear(
+            config.hidden_size,
+            config.intermediate_size,
+            rank=config.rank_r,
+            codebook_size=config.codebook_k,
+            num_atoms=config.num_atoms_A,
+            xor_arity=config.xor_arity_b,
+            commitment_beta=config.commitment_beta,
+            atom_ema_decay=config.atom_ema_decay,
+            use_moe=config.use_moe,
+            num_experts=config.num_experts if config.use_moe else 4,
+            moe_top_k=config.moe_top_k if config.use_moe else 2,
+        )
+
+        self.down_proj = TRILIXLinear(
+            config.intermediate_size,
+            config.hidden_size,
+            rank=config.rank_r,
+            codebook_size=config.codebook_k,
+            num_atoms=config.num_atoms_A,
+            xor_arity=config.xor_arity_b,
+            commitment_beta=config.commitment_beta,
+            atom_ema_decay=config.atom_ema_decay,
+            use_moe=config.use_moe,
+            num_experts=config.num_experts if config.use_moe else 4,
+            moe_top_k=config.moe_top_k if config.use_moe else 2,
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+        """SwiGLU: gate * silu(up) -> down"""
+        aux_losses = {}
+
+        gate, gate_losses = self.gate_proj(x)
+        up, up_losses = self.up_proj(x)
+
+        for k_loss in [gate_losses, up_losses]:
+            for key, val in k_loss.items():
+                aux_losses[f"ffn_{key}"] = aux_losses.get(f"ffn_{key}", 0) + val
+
+        # SwiGLU
+        intermediate = F.silu(gate) * up
+
+        output, down_losses = self.down_proj(intermediate)
+        for key, val in down_losses.items():
+            aux_losses[f"ffn_down_{key}"] = val
+
+        return output, aux_losses
+
+
+class TRILIXLayer(nn.Module):
+    """Single TRILIX transformer layer"""
+
+    def __init__(self, config: TRILIXConfig):
+        super().__init__()
+
+        self.input_layernorm = TRILIXRMSNorm(config.hidden_size)
+        self.self_attn = TRILIXAttention(config)
+        self.post_attention_layernorm = TRILIXRMSNorm(config.hidden_size)
+        self.mlp = TRILIXSwiGLU(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple], Dict]:
+
+        aux_losses = {}
+
+        # Self attention
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, present_kv, attn_losses = self.self_attn(
+            hidden_states,
+            attention_mask=attention_mask,
+            past_key_value=past_key_value,
+        )
+        aux_losses.update(attn_losses)
+        hidden_states = residual + hidden_states
+
+        # FFN
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        mlp_output, mlp_losses = self.mlp(hidden_states)
+        aux_losses.update(mlp_losses)
+        hidden_states = residual + mlp_output
+
+        return hidden_states, present_kv, aux_losses
+
+
+class TRILIXTransformer(nn.Module):
+    """Full TRILIX Transformer model"""
+
+    def __init__(self, config: TRILIXConfig):
+        super().__init__()
+
+        self.config = config
+
+        # Embeddings (kept in BF16 - not compressed)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+
+        # Transformer layers
+        self.layers = nn.ModuleList(
+            [TRILIXLayer(config) for _ in range(config.num_hidden_layers)]
+        )
+
+        # Final norm
+        self.norm = TRILIXRMSNorm(config.hidden_size)
+
+        # LM head (kept in BF16 - not compressed)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # A2: World Model head для предсказания следующего латентного состояния
+        # Проецируем hidden_size -> rank_r для предсказания z_next
+        self.world_model_head = WorldModelHead(
+            r=config.rank_r, hidden_dim=config.rank_r * 2
+        )
+        self.z_projector = nn.Linear(config.hidden_size, config.rank_r)
+
+        # A3: Belief Gate — убеждения агента о мире
+        self.belief_gate = BeliefGate(r=config.rank_r, belief_dim=config.rank_r // 4)
+
+        # C1: EDH — Error-Driven Hypernetwork
+        self.edh = ErrorDrivenHypernetwork(
+            error_dim=64,
+            builder_dim=config.rank_r,
+            num_builders=8,
+        )
+
+        # C2: REL — Reflective Error Loop
+        self.rel = ReflectiveErrorLoop(
+            hidden_dim=config.hidden_size,
+            uncertainty_dim=16,
+        )
+
+        # A1: Soul Codebook — файл "души" агента
+        self.soul_codebook = SoulCodebook(num_agents=1024, r=config.rank_r)
+        self.soul_projector = nn.Linear(config.rank_r, config.hidden_size)
+
+        # B2: Emergent Agent Swarm — 1024 агента работают как рой
+        # Все агенты доступны через SoulCodebook, Swarm добавляет attention
+        self.agent_swarm = EmergentAgentSwarm(
+            num_agents=1024, r=config.rank_r, num_heads=4
+        )
+
+        # B5: SDO — Symbolic Diff Operations для reasoning
+        self.symbolic_diff_loss = SymbolicDiffLoss(rank=config.rank_r)
+
+        # Initialize
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights"""
+        # Embeddings
+        nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=0.006)
+        nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.006)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[list] = None,
+        labels: Optional[torch.Tensor] = None,
+        soul_id: Optional[torch.Tensor] = None,
+    ) -> Dict:
         """
-        lines = ["Top Checkpoints by Codebook Quality:"]
-        for i, ckpt in enumerate(self.checkpoint_stats, 1):
-            lines.append(
-                f"  {i}. Step {ckpt['step']}: "
-                f"diversity={ckpt['stats'].get('codebook_diversity', 0):.4f} "
-                f"score={ckpt['score']:.4f}"
+        Forward pass
+
+        Args:
+            soul_id: [batch] — ID агента (0..1023). Если None — случайный.
+
+        Returns dict with:
+        - logits: [batch, seq_len, vocab_size]
+        - loss: total loss including aux losses
+        - aux_losses: breakdown of auxiliary losses
+        """
+        batch_size, seq_len = input_ids.shape
+
+        all_aux_losses = {}
+
+        # Embeddings
+        hidden_states = self.embed_tokens(input_ids)
+
+        # A1: Soul Codebook — добавляем "душу" агента к латентному пространству
+        # Если soul_id не передан — случайный агент
+        if soul_id is None:
+            soul_id = torch.randint(
+                0, self.soul_codebook.num_agents, (batch_size,), device=input_ids.device
             )
-        return "\n".join(lines)
+        soul_vector = self.soul_codebook(soul_id)  # [batch, rank]
+        soul_vector = self.soul_projector(soul_vector)  # [batch, hidden_size]
+
+        # B2: Emergent Agent Swarm — агент получает attention от других агентов
+        if self.training:
+            all_soul = self.soul_codebook.soul_vectors.weight  # [1024, rank]
+            task_emb = hidden_states.mean(dim=1)  # [batch, hidden]
+            task_emb_low = self.z_projector(task_emb)  # [batch, rank]
+            task_emb_expanded = task_emb_low.unsqueeze(1).expand(
+                -1, all_soul.size(0), -1
+            )
+            all_soul_expanded = all_soul.unsqueeze(0).expand(batch_size, -1, -1)
+            swarm_result = self.agent_swarm(all_soul_expanded, task_emb_low)
+            swarm_boost = swarm_result["boosted_soul"]
+            agent_idx = (
+                soul_id.unsqueeze(-1).expand(-1, self.config.rank_r).unsqueeze(1)
+            )
+            swarm_soul = torch.gather(swarm_boost, 1, agent_idx).squeeze(1)
+            swarm_soul_proj = self.soul_projector(swarm_soul)
+            hidden_states = hidden_states + swarm_soul_proj.unsqueeze(1) * 0.05
+            all_aux_losses["swarm_specialization"] = swarm_result["specialization_loss"]
+        else:
+            all_aux_losses["swarm_specialization"] = torch.tensor(
+                0.0, device=hidden_states.device
+            )
+
+        hidden_states = hidden_states + soul_vector.unsqueeze(1) * 0.1
+
+        # Prepare attention mask
+        if attention_mask is not None:
+            # Convert to additive mask
+            attention_mask = (1.0 - attention_mask) * -10000.0
+
+        # Transformer layers
+        present_key_values = [] if past_key_values is None else past_key_values
+
+        for i, layer in enumerate(self.layers):
+            past_kv = present_key_values[i] if past_key_values is not None else None
+
+            hidden_states, present_kv, aux_losses = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                past_key_value=past_kv,
+            )
+
+            for key, val in aux_losses.items():
+                all_aux_losses[f"layer_{i}_{key}"] = val
+
+            if past_key_values is not None:
+                present_key_values.append(present_kv)
+
+        # Final norm
+        hidden_states = self.norm(hidden_states)
+
+        # LM head
+        logits = self.lm_head(hidden_states)
+
+        # Calculate losses
+        total_loss = None
+        if labels is not None:
+            # Main CE loss
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+
+            loss_fct = nn.CrossEntropyLoss()
+            ce_loss = loss_fct(
+                shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1)
+            )
+
+        # A2: World Model loss — предсказание следующего латентного состояния
+        # Среднее по sequence для каждого элемента батча
+        z = hidden_states.mean(dim=1)  # [batch, hidden_size]
+        z_proj = self.z_projector(z)  # [batch, rank]
+
+        # z_next — следующий токен (среднее по sequence на 1 шаг вперёд)
+        z_next = hidden_states[:, 1:, :].mean(dim=1)  # [batch, hidden_size]
+        z_next_proj = self.z_projector(z_next)  # [batch, rank]
+
+        # Предсказание
+        z_pred = self.world_model_head(z_proj)  # [batch, rank]
+
+        # A3: Belief Gate — модулируем предсказание на основе убеждений агента
+        belief_result = self.belief_gate(
+            z_proj, z_pred, z_next_proj, return_belief=False
+        )
+        gated_pred = belief_result["gated_pred"]
+        belief_loss = belief_result["belief_loss"]
+
+        # World Model loss — MSE между предсказанным и реальным следующим состоянием
+        world_model_loss = F.mse_loss(
+            gated_pred, z_next_proj.detach()
+        )  # detach чтобы не мешать CE
+
+        # Auxiliary losses
+        aux_loss_sum = sum(all_aux_losses.values())
+
+        # Note: diversity loss is already included in aux_loss_sum as atom_diversity
+        # We extract it for logging only
+        diversity_loss = sum(
+            all_aux_losses.get(f"layer_{i}_atom_diversity", torch.tensor(0.0))
+            for i in range(self.config.num_hidden_layers)
+        )
+
+        # A2: World Model loss в сумму aux losses (с весом 0.1 чтобы не доминировать)
+        aux_loss_sum = aux_loss_sum + 0.1 * world_model_loss
+
+        # A3: Belief Gate loss
+        aux_loss_sum = aux_loss_sum + 0.05 * belief_loss
+
+        # B5: SDO — Symbolic Diff Operations для reasoning
+        # Семплируем codebook из первого слоя
+        codebook_U_sdo = None
+        codebook_V_sdo = None
+        for layer in self.layers:
+            if codebook_U_sdo is None:
+                trilix_layer = layer.self_attn.q_proj
+                if hasattr(trilix_layer, "_get_combo_indices_hard"):
+                    atoms_U_bin = STEBinary.apply(trilix_layer.atoms_U)
+                    atoms_V_bin = STEBinary.apply(trilix_layer.atoms_V)
+                    combo_idx_U = trilix_layer._get_combo_indices_hard(
+                        trilix_layer.combo_indices_U_logits
+                    )
+                    combo_idx_V = trilix_layer._get_combo_indices_hard(
+                        trilix_layer.combo_indices_V_logits
+                    )
+                    codebook_U_sdo = trilix_layer._decode_codebook_entry(
+                        trilix_layer.combo_weights_U, combo_idx_U, atoms_U_bin
+                    )
+                    codebook_V_sdo = trilix_layer._decode_codebook_entry(
+                        trilix_layer.combo_weights_V, combo_idx_V, atoms_V_bin
+                    )
+                break
+
+        sdo_loss = torch.tensor(0.0, device=hidden_states.device)
+        if codebook_U_sdo is not None:
+            sdo_loss = self.symbolic_diff_loss(codebook_U_sdo, codebook_V_sdo)
+            aux_loss_sum = aux_loss_sum + sdo_loss
+
+        # C1: EDH — Error-Driven Hypernetwork
+        edh_result = self.edh(
+            ce_loss=ce_loss,
+            world_model_loss=world_model_loss,
+            diversity_loss=diversity_loss,
+            belief_loss=belief_loss,
+        )
+        edh_loss = edh_result["builder_loss"]
+        aux_loss_sum = aux_loss_sum + 0.05 * edh_loss
+
+        # C2: REL — Reflective Error Loop
+        if labels is not None:
+            shift_logits_for_rel = logits[..., :-1, :].contiguous()
+            shift_labels_for_rel = labels[..., 1:].contiguous()
+            rel_result = self.rel(
+                hidden_states=hidden_states,
+                logits=shift_logits_for_rel,
+                labels=shift_labels_for_rel,
+            )
+            rel_loss = rel_result["reflective_loss"]
+        else:
+            rel_loss = torch.tensor(0.0, device=hidden_states.device)
+        aux_loss_sum = aux_loss_sum + 0.05 * rel_loss
+
+        total_loss = ce_loss + aux_loss_sum
+
+        all_aux_losses["ce_loss"] = ce_loss
+        all_aux_losses["total_aux"] = aux_loss_sum
+        all_aux_losses["diversity_total"] = diversity_loss
+        all_aux_losses["world_model_loss"] = world_model_loss
+        all_aux_losses["sdo_loss"] = sdo_loss
+        all_aux_losses["belief_loss"] = belief_loss
+        all_aux_losses["edh_loss"] = edh_loss
+        all_aux_losses["rel_loss"] = rel_loss
+
+        return {
+            "logits": logits,
+            "loss": total_loss,
+            "aux_losses": all_aux_losses,
+            "past_key_values": present_key_values,
+        }
+
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 100,
+        temperature: float = 1.0,
+        top_k: int = 50,
+    ) -> torch.Tensor:
+        """Simple greedy generation"""
+
+        past_key_values = None
+
+        for _ in range(max_new_tokens):
+            # Forward
+            outputs = self.forward(
+                input_ids if past_key_values is None else input_ids[:, -1:],
+                past_key_values=past_key_values,
+            )
+
+            logits = outputs["logits"][:, -1, :]  # Last token
+
+            # Temperature scaling
+            logits = logits / temperature
+
+            # Top-k
+            if top_k > 0:
+                indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+                logits[indices_to_remove] = float("-inf")
+
+            # Sample
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+
+            # Append
+            input_ids = torch.cat([input_ids, next_token], dim=-1)
+
+            if past_key_values is not None:
+                past_key_values = outputs["past_key_values"]
+
+        return input_ids
+
+    def get_memory_stats(self) -> Dict:
+        """Get memory statistics for the model"""
+        stats = {
+            "embeddings_mb": self.config.vocab_size
+            * self.config.hidden_size
+            * 2
+            / 1e6,  # BF16
+            "lm_head_mb": self.config.vocab_size * self.config.hidden_size * 2 / 1e6,
+        }
+
+        # TRILIX layers stats
+        total_eval_bits = 0
+        total_train_bits = 0
+
+        for layer in self.layers:
+            for proj in [
+                layer.self_attn.q_proj,
+                layer.self_attn.k_proj,
+                layer.self_attn.v_proj,
+                layer.self_attn.o_proj,
+            ]:
+                proj_stats = proj.count_parameters()
+                total_eval_bits += proj_stats["total_eval_bits"]
+                total_train_bits += proj_stats["total_train_bits"]
+
+            for proj in [layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj]:
+                proj_stats = proj.count_parameters()
+                total_eval_bits += proj_stats["total_eval_bits"]
+                total_train_bits += proj_stats["total_train_bits"]
+
+        # Original size
+        num_params = self.config.num_hidden_layers * (
+            4 * self.config.hidden_size * self.config.hidden_size  # attn
+            + 3 * self.config.hidden_size * self.config.intermediate_size  # ffn
+        )
+        original_bits = num_params * 16
+
+        stats["trilix_eval_mb"] = total_eval_bits / 8 / 1e6
+        stats["trilix_train_mb"] = total_train_bits / 8 / 1e6
+        stats["original_mb"] = original_bits / 8 / 1e6
+        stats["bpw_eval"] = total_eval_bits / original_bits
+        stats["bpw_train"] = total_train_bits / original_bits
+        stats["compression_ratio"] = original_bits / total_eval_bits
+
+        return stats

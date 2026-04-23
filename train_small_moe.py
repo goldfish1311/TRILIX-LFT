@@ -21,7 +21,14 @@ import torch
 import torch.nn.functional as F
 from trilix.config import TRILIXConfig
 from trilix.model import TRILIXTransformer
-from trilix.layers import TemperatureCascadeScheduler
+from trilix.layers import (
+    TemperatureCascadeScheduler,
+    MuonOptimizer,
+    CosineLoss,
+    AGIWarmup,
+    CodebookStatsTracker,
+    SequencePacker,
+)
 import time
 import os
 
@@ -100,40 +107,61 @@ for layer in model.modules():
         dae_layer_count += 1
 log(f"  DAE enabled on {dae_layer_count} TRILIXLinear layers")
 
-# Optimizer - differential learning rates + per-group gradient clipping (D2)
-    scale_params = []           # clip 0.5 (строгий — быстро учатся)
-    atom_params = []            # clip 2.0 (мягкий — медленная эволюция)
-    idx_params = []             # clip 1.0 (стандартный — idx_logits, combo_indices)
-    moe_params = []             # clip 1.0
-    world_model_params = []      # clip 1.0
-    soul_params = []             # clip 1.0
-    other_params = []            # clip 1.0
+# H1: Muon Optimizer — разделить параметры на matrix (Muon) и vector (AdamW)
+scale_params = []  # clip 0.5 (строгий — быстро учатся) — AdamW
+atom_params = []  # clip 2.0 (мягкий — медленная эволюция) — AdamW
+idx_params = []  # clip 1.0 (стандартный) — MUON (matrix params)
+moe_params = []  # clip 1.0 — AdamW
+world_model_params = []  # clip 1.0 — AdamW
+soul_params = []  # clip 1.0 — AdamW
+other_params = []  # clip 1.0 — AdamW
 
-    for name, param in model.named_parameters():
-        if "scale" in name and "latent" not in name:
-            scale_params.append(param)
-        elif "atoms" in name:  # atoms_U, atoms_V — медленная эволюция
-            atom_params.append(param)
-        elif "idx_" in name or "combo_" in name:  # индекс-логиты
-            idx_params.append(param)
-        elif "moe" in name or "expert" in name or "router" in name:
-            moe_params.append(param)
-        elif "world_model" in name or "z_projector" in name:
-            world_model_params.append(param)
-        elif "soul_projector" in name:
-            soul_params.append(param)
-        elif "soul_codebook" in name:
-            soul_params.append(param)
+# H1: Muon для 2D матричных параметров (idx_logits, combo_indices, combo_weights)
+muon_params = []
+
+for name, param in model.named_parameters():
+    if "scale" in name and "latent" not in name:
+        scale_params.append(param)
+    elif "atoms" in name:  # atoms_U, atoms_V — медленная эволюция
+        atom_params.append(param)
+    elif "idx_" in name or "combo_" in name:  # индекс-логиты и комбинации
+        # H1: Если параметр 2D (matrix) — в Muon, иначе — AdamW
+        if param.dim() >= 2:
+            muon_params.append(param)
         else:
-            other_params.append(param)
+            idx_params.append(param)
+    elif "moe" in name or "expert" in name or "router" in name:
+        moe_params.append(param)
+    elif "world_model" in name or "z_projector" in name:
+        world_model_params.append(param)
+    elif "soul_projector" in name:
+        soul_params.append(param)
+    elif "soul_codebook" in name:
+        soul_params.append(param)
+    else:
+        other_params.append(param)
 
-optimizer = torch.optim.AdamW(
+log(f"\nH1: Muon Optimizer for {len(muon_params)} matrix parameters")
+log(
+    f"    AdamW for {len(scale_params) + len(atom_params) + len(idx_params) + len(other_params)} other parameters"
+)
+
+# H1: Muon Optimizer для matrix параметров (idx_logits, combo_indices, combo_weights)
+muon_optimizer = (
+    MuonOptimizer(muon_params, lr=0.02, momentum=0.95, weight_decay=0.01)
+    if muon_params
+    else None
+)
+
+# AdamW для векторных параметров
+adamw_optimizer = torch.optim.AdamW(
     [
         {"params": scale_params, "lr": 3e-3, "weight_decay": 0.0},
+        {"params": atom_params, "lr": 1e-4, "weight_decay": 0.0},
+        {"params": idx_params, "lr": 3e-4, "weight_decay": 0.1},
         {"params": moe_params, "lr": 1e-4, "weight_decay": 0.1},
         {"params": world_model_params, "lr": 3e-4, "weight_decay": 0.1},
         {"params": soul_params, "lr": 1e-4, "weight_decay": 0.01},
-        {"params": binary_params, "lr": 3e-5, "weight_decay": 0.0},
         {"params": other_params, "lr": 3e-4, "weight_decay": 0.1},
     ],
     betas=(0.9, 0.95),
@@ -168,16 +196,20 @@ for layer in model.modules():
 
 
 # AGI Phase Scheduler with Temperature Annealing
-set_agi_phase = None  # removed - ATC scheduler used instead
-
+# H4: AGI Warmup — linear interpolation instead of hard switch
+agi_warmup = AGIWarmup(warmup_steps=300, target_weight=0.1)
 
 step = 0
 accumulated_loss = 0.0
 start_time = time.time()
 first_step_time = None
-world_model_loss_val = 0.0  # A2: World Model loss
+world_model_loss_val = 0.0 # A2: World Model loss
 
-set_agi_phase(model, step)
+# Apply AGI warmup weight
+agi_weight = agi_warmup.get_weight(step)
+for module in model.modules():
+    if hasattr(module, "agi_weight"):
+        module.agi_weight = agi_weight
 
 # Pre-warmup: make sure model is fully initialized on GPU
 log("Warming up GPU...")
@@ -296,12 +328,18 @@ while step < max_steps:
     # Soul
     if soul_params:
         torch.nn.utils.clip_grad_norm_(soul_params, max_norm=1.0)
-    # Остальное
-    if other_params:
-        torch.nn.utils.clip_grad_norm_(other_params, max_norm=1.0)
+# Остальное
+if other_params:
+    torch.nn.utils.clip_grad_norm_(other_params, max_norm=1.0)
 
-    optimizer.step()
-    optimizer.zero_grad()
+# H1: Muon optimizer step
+if muon_optimizer is not None:
+    muon_optimizer.step()
+    muon_optimizer.zero_grad()
+
+    # AdamW optimizer step
+    adamw_optimizer.step()
+    adamw_optimizer.zero_grad()
 
     # Apply ATC temperatures
     temp_scheduler.apply_to_model(model, step)

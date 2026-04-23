@@ -29,6 +29,12 @@ from .layers import (
     DiscreteSemanticAlgebra,
     LatentDiffusionCodebook,
     DynamicBPWAllocator,
+    # H1-H5: Second-wave critical innovations
+    MuonOptimizer,
+    SequencePacker,
+    CosineLoss,
+    AGIWarmup,
+    CodebookStatsTracker,
 )
 from .model import TRILIXTransformer
 
@@ -57,4 +63,10 @@ __all__ = [
     "DiscreteSemanticAlgebra",
     "LatentDiffusionCodebook",
     "DynamicBPWAllocator",
+    # H1-H5: Second-wave critical innovations
+    "MuonOptimizer",
+    "SequencePacker",
+    "CosineLoss",
+    "AGIWarmup",
+    "CodebookStatsTracker",
 ]
