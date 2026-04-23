@@ -40,8 +40,8 @@ class TRILIXConfig:
     warmup_steps: int = 2000
     gradient_clip: float = 1.0
 
-    # Loss coefficients
-    commitment_beta: float = 0.25
+    # Loss coefficients - FIXED: 0.25 explodes loss with 168 codebooks
+    commitment_beta: float = 0.0001
     atom_diversity_weight: float = 0.01
 
     # EMA for atoms

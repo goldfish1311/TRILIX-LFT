@@ -76,13 +76,6 @@ class MoECodebook(nn.Module):
     """
     Mixture of Experts for Codebook generation.
     Each token gets routed to top-2 experts based on its latent representation.
-    Experts generate SOFT ATTENTION MASKS that modulate which atoms/entries
-    each token uses — this creates a gradient path back to expert weights.
-
-    Architecture:
-    - MoE output: [N, k] attention mask over codebook entries
-    - This mask is used INSTEAD OF argmax to select atoms
-    - Backprop: mask → expert_codebooks → combo_weights (FULLY DIFFERENTIABLE)
 
     Args:
         num_experts: Number of codebook experts (default: 4)
@@ -98,6 +91,7 @@ class MoECodebook(nn.Module):
         self.r = r
         self.top_k = top_k
 
+        # Create experts
         self.experts = nn.ModuleList(
             [
                 CodebookExpert(k=k, r=r, num_atoms=16, xor_arity=3)
@@ -105,6 +99,7 @@ class MoECodebook(nn.Module):
             ]
         )
 
+        # Router: projects from latent space to expert selection
         self.router = nn.Linear(r, num_experts, bias=False)
 
     def forward(
@@ -112,49 +107,65 @@ class MoECodebook(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            x_latent: [*, r] - any shape ending with rank dimension
+            x_latent: [batch, seq, r] - latent representations after V^T·x
             temperature: For gating softmax
 
         Returns:
-            soft_attention_mask: [N, k] - soft attention over codebook entries
-                              (fully differentiable!)
+            codebook_output: [batch, seq, r] - weighted expert outputs
             aux_loss: Load balancing loss for training
         """
-        original_shape = x_latent.shape
-        rank_dim = self.r
+        batch_size, seq_len, r = x_latent.shape
 
-        x_flat = x_latent.view(-1, rank_dim)
-        N = x_flat.shape[0]
+        # Token-level routing
+        # router_logits: [batch, seq, num_experts]
+        router_logits = self.router(x_latent)
 
-        x_for_moe = x_flat.unsqueeze(1)
+        # Top-k gating
+        gates, expert_ids = torch.topk(
+            F.softmax(router_logits / max(temperature, 0.1), dim=-1), self.top_k, dim=-1
+        )  # gates: [B, S, top_k], expert_ids: [B, S, top_k]
 
-        router_logits = self.router(x_for_moe)
+        # Normalize gates
+        gates = gates / gates.sum(dim=-1, keepdim=True)  # [B, S, top_k]
 
-        gate_weights = F.softmax(
-            router_logits / max(temperature, 0.1), dim=-1
-        )  # [N, 1, num_experts]
-
+        # Gather outputs from experts
+        # For efficiency, we compute all expert codebooks once per layer
         expert_codebooks = []
         for expert in self.experts:
-            expert_codebooks.append(expert.get_codewords_soft(temperature))
+            expert_codebooks.append(expert.get_codewords(temperature))  # List of [k, r]
 
-        expert_codebook_stacked = torch.stack(expert_codebooks, dim=0)  # [E, k, r]
+        # For now: return routing info and let TRILIXLinear handle lookup
+        # We'll store expert outputs for the layer to use
+        self._cached_expert_codebooks = expert_codebooks
+        self._cached_gates = gates
+        self._cached_expert_ids = expert_ids
 
-        attention_mask = torch.einsum(
-            "ne,ekr->nkr", gate_weights.squeeze(1), expert_codebook_stacked
-        )  # [N, k, r]
+        # Compute load balancing loss (encourage uniform expert usage)
+        router_prob = F.softmax(router_logits, dim=-1)  # [B, S, E]
+        aux_loss = (
+            self.num_experts
+            * (
+                router_prob.mean(dim=[0, 1])
+                * (router_prob > 0).float().mean(dim=[0, 1])
+            ).sum()
+        )
 
-        attention_mask = F.normalize(attention_mask, dim=-1)  # [N, k, r] L2 normalized
+        # Return weighted combination of expert centroids
+        # For simplicity: average of expert codebooks weighted by gate
+        combined = torch.zeros(batch_size, seq_len, r, device=x_latent.device)
+        for i in range(self.num_experts):
+            # Check where this expert is in top-k
+            expert_mask = (expert_ids == i).any(dim=-1).float()  # [B, S]
+            expert_gate = (
+                gates[..., 0] * (expert_ids[..., 0] == i).float()
+                + gates[..., 1] * (expert_ids[..., 1] == i).float()
+            )  # [B, S]
 
-        aux_loss = self.num_experts * (gate_weights.squeeze(1).std())
+            # Add contribution (using centroid of expert codebook)
+            expert_centroid = expert_codebooks[i].mean(dim=0)  # [r]
+            combined += expert_gate.unsqueeze(-1) * expert_centroid
 
-        out_flat = attention_mask.sum(dim=1)  # [N, r]
-        out = out_flat.view(original_shape)
-
-        self._cached_gate_weights = gate_weights.squeeze(1)
-        self._cached_attention_mask = attention_mask
-
-        return out, aux_loss
+        return combined, aux_loss
 
 
 class STEBinary(torch.autograd.Function):
@@ -294,21 +305,9 @@ class TRILIXLinear(nn.Module):
         )
         self.register_buffer("step_counter", torch.zeros(1, dtype=torch.long))
 
-        # Codebook cache to avoid recomputation
-        self.register_buffer("_codebook_cache_U", torch.zeros(codebook_size, rank))
-        self.register_buffer("_codebook_cache_V", torch.zeros(codebook_size, rank))
-        self.register_buffer(
-            "_combo_cache_U", torch.zeros(codebook_size, xor_arity, num_atoms)
-        )
-        self.register_buffer(
-            "_combo_cache_V", torch.zeros(codebook_size, xor_arity, num_atoms)
-        )
-        self.register_buffer("_cache_gen", torch.zeros(1, dtype=torch.long))
-
         # AGI: Atom Gradient Injection parameters
         self.agi_weight = 0.0  # Will be set by phase scheduler
-        self.agi_phase = 1  # 0=disabled, 1=active (ENABLE FOR GRADIENTS!)
-        self.agi_weight = 0.1  # Weight for AGI alignment loss
+        self.agi_phase = 0  # 0=disabled, 1=active
         self._cached_agi_loss = torch.tensor(0.0)
 
         self._init_parameters()
@@ -461,31 +460,42 @@ class TRILIXLinear(nn.Module):
         Quantize U matrix
         Returns: (U_hard, U_soft, commitment_loss)
         """
+        # Get binary atoms
         atoms_U_bin, _ = self._get_atoms_binary()
 
+        # Get hard combination indices
         combo_idx_U = self._get_combo_indices_hard(self.combo_indices_U_logits)
 
+        # Decode codebook
         codebook_U = self._decode_codebook_entry(
             self.combo_weights_U, combo_idx_U, atoms_U_bin
         )
 
+        # Get indices for each row of U
+        # Soft indices for training
         idx_U_soft = F.softmax(
             self.idx_U_logits, dim=-1
         )  # [out_features, codebook_size]
 
+        # Hard indices (one-hot)
         idx_U_hard_idx = torch.argmax(idx_U_soft, dim=-1)  # [out_features]
 
+        # Gather codewords
         U_hard = codebook_U[idx_U_hard_idx]  # [out_features, rank]
 
+        # Soft version for gradient flow (matmul with softmax weights)
         U_soft = torch.matmul(idx_U_soft, codebook_U)  # [out_features, rank]
 
+        # Commitment loss: encourage soft to stay close to hard
         commitment_loss = self.commitment_beta * F.mse_loss(U_soft.detach(), U_hard)
 
+        # Update EMA and usage counters
         with torch.no_grad():
             self.usage_counter_U.index_add_(
                 0, idx_U_hard_idx, torch.ones_like(idx_U_hard_idx, dtype=torch.long)
             )
 
+            # EMA update of codebook
             for i in range(self.codebook_size):
                 mask = idx_U_hard_idx == i
                 if mask.any():
@@ -494,25 +504,17 @@ class TRILIXLinear(nn.Module):
                     ] + (1 - self.atom_ema_decay) * U_hard[mask].mean(0)
                     self.codebook_U_count[i] += 1
 
+        # Use hard for forward, soft for backward (via STE implicitly)
         U_final = STEIndex.apply(U_soft, U_hard)
-
-        self._cached_U_soft = U_soft
-        self._cached_codebook_U = codebook_U
-        self._cached_atoms_U_bin = atoms_U_bin
-        self._cached_combo_idx_U = combo_idx_U
 
         return U_final, U_soft, commitment_loss
 
     def _quantize_V(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Same as _quantize_U but for V"""
-        atoms_U_bin, atoms_V_bin = self._get_atoms_binary()
+        _, atoms_V_bin = self._get_atoms_binary()
 
-        combo_idx_U = self._get_combo_indices_hard(self.combo_indices_U_logits)
         combo_idx_V = self._get_combo_indices_hard(self.combo_indices_V_logits)
 
-        codebook_U = self._decode_codebook_entry(
-            self.combo_weights_U, combo_idx_U, atoms_U_bin
-        )
         codebook_V = self._decode_codebook_entry(
             self.combo_weights_V, combo_idx_V, atoms_V_bin
         )
@@ -521,7 +523,7 @@ class TRILIXLinear(nn.Module):
         idx_V_hard_idx = torch.argmax(idx_V_soft, dim=-1)
 
         V_hard = codebook_V[idx_V_hard_idx]  # [in_features, rank]
-        V_soft = torch.matmul(idx_V_soft, codebook_V)  # [in_features, rank]
+        V_soft = torch.matmul(idx_V_soft, codebook_V)
 
         commitment_loss = self.commitment_beta * F.mse_loss(V_soft.detach(), V_hard)
 
@@ -539,14 +541,6 @@ class TRILIXLinear(nn.Module):
                     self.codebook_V_count[i] += 1
 
         V_final = STEIndex.apply(V_soft, V_hard)
-
-        self._cached_V_soft = V_soft
-        self._cached_codebook_U = codebook_U
-        self._cached_codebook_V = codebook_V
-        self._cached_atoms_U_bin = atoms_U_bin
-        self._cached_atoms_V_bin = atoms_V_bin
-        self._cached_combo_idx_U = combo_idx_U
-        self._cached_combo_idx_V = combo_idx_V
 
         return V_final, V_soft, commitment_loss
 
@@ -593,56 +587,63 @@ class TRILIXLinear(nn.Module):
         return losses[0] if losses else None
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+        """
+        Forward pass with all three compression levels
+
+        AGI: Dual-path forward
+        - Hard path: STE-based, for actual computation
+        - Soft path: Fully differentiable, for gradient injection into atoms
+
+        Returns:
+            output: [batch, out_features]
+            aux_losses: dict with commitment losses, AGI losses etc.
+        """
         aux_losses = {}
 
+        # Level 2: Get quantized U and V (HARD PATH - STE-based)
         U_hard, U_soft, commit_U = self._quantize_U()
         V_hard, V_soft, commit_V = self._quantize_V()
 
         aux_losses["commitment_U"] = commit_U
         aux_losses["commitment_V"] = commit_V
 
+        # Check codebook restart
         restart_loss = self._check_codebook_restart()
         if restart_loss is not None:
             aux_losses["codebook_restart"] = restart_loss
 
+        # Level 1: Latent factorization with scales
+        # W_eff = diag(h) · U · diag(l) · V^T · diag(g)
+        # Efficient computation:
+        # y = h ⊙ (U · (l ⊙ (V^T · (g ⊙ x))))
+
+        # Clamp scales to prevent runaway (P0 fix from Gemini)
         row_scale = torch.clamp(self.row_scale, -self.scale_max, self.scale_max)
         col_scale = torch.clamp(self.col_scale, -self.scale_max, self.scale_max)
         latent_scale = torch.clamp(self.latent_scale, -self.scale_max, self.scale_max)
 
-        x_scaled = x * col_scale
+        # Step 1: apply col_scale g to input
+        x_scaled = x * col_scale  # broadcast
 
-        if self.training and self.agi_phase > 0 and hasattr(self, "_cached_U_soft"):
-            agi_blend = min(0.5, 0.1 + self.xor_temp_steps * 0.0001)
-            U_for_calc = (
-                agi_blend * self._cached_U_soft + (1 - agi_blend) * U_hard.detach()
-            )
-            V_for_calc = (
-                agi_blend * self._cached_V_soft + (1 - agi_blend) * V_hard.detach()
-            )
+        # Step 2: V^T · (g ⊙ x)
+        latent = torch.matmul(x_scaled, V_hard)  # [batch, rank]
 
-            latent = torch.matmul(x_scaled, V_for_calc)
+        # Step 3: apply latent_scale l (clamped!)
+        latent = latent * latent_scale  # [batch, rank]
 
-            if self.use_moe and self.moe_codebook_U is not None:
-                moe_out_U, moe_aux_U = self.moe_codebook_U(
-                    latent, self.xor_temperature.item()
-                )
-                moe_out_V, moe_aux_V = self.moe_codebook_V(
-                    latent, self.xor_temperature.item()
-                )
-                self.moe_codebook_U._cached_moe_aux_loss = moe_aux_U
-                self.moe_codebook_V._cached_moe_aux_loss = moe_aux_V
-                latent = latent + 0.05 * (moe_out_U + moe_out_V)
-                aux_losses["moe_aux_U"] = moe_aux_U
-                aux_losses["moe_aux_V"] = moe_aux_V
+        # Step 4: U · (l ⊙ V^T · g ⊙ x)
+        output = torch.matmul(latent, U_hard.T)  # [batch, out_features]
 
-            latent = latent * latent_scale
-            output = torch.matmul(latent, U_for_calc.T)
-            output = output * row_scale
+        # Step 5: apply row_scale h (clamped!)
+        output = output * row_scale
 
-        elif self.training and self.agi_phase > 0:
+        # === AGI: SOFT PATH (for gradient injection only) ===
+        if self.training and self.agi_phase > 0:
+            # Get atoms (NOT binarized - direct gradient flow!)
             atoms_U_raw = self.atoms_U
             atoms_V_raw = self.atoms_V
 
+            # Decode codebook via soft path (fully differentiable)
             soft_codebook_U = self._decode_codebook_soft(
                 self.combo_weights_U, self.combo_indices_U_logits, atoms_U_raw
             )
@@ -650,30 +651,24 @@ class TRILIXLinear(nn.Module):
                 self.combo_weights_V, self.combo_indices_V_logits, atoms_V_raw
             )
 
-            atoms_U_bin = getattr(self, "_cached_atoms_U_bin", None)
-            atoms_V_bin = getattr(self, "_cached_atoms_V_bin", None)
-            combo_idx_U = getattr(self, "_cached_combo_idx_U", None)
-            combo_idx_V = getattr(self, "_cached_combo_idx_V", None)
-            codebook_U_cached = getattr(self, "_cached_codebook_U", None)
-            codebook_V_cached = getattr(self, "_cached_codebook_V", None)
+            # Get hard codebooks for alignment (detached!)
+            atoms_U_bin, atoms_V_bin = self._get_atoms_binary()
+            combo_idx_U = self._get_combo_indices_hard(self.combo_indices_U_logits)
+            combo_idx_V = self._get_combo_indices_hard(self.combo_indices_V_logits)
+            hard_codebook_U = self._decode_codebook_entry(
+                self.combo_weights_U, combo_idx_U, atoms_U_bin
+            )
+            hard_codebook_V = self._decode_codebook_entry(
+                self.combo_weights_V, combo_idx_V, atoms_V_bin
+            )
 
-            if codebook_U_cached is None:
-                atoms_U_bin, atoms_V_bin = self._get_atoms_binary()
-                combo_idx_U = self._get_combo_indices_hard(self.combo_indices_U_logits)
-                combo_idx_V = self._get_combo_indices_hard(self.combo_indices_V_logits)
-                codebook_U_cached = self._decode_codebook_entry(
-                    self.combo_weights_U, combo_idx_U, atoms_U_bin
-                )
-                codebook_V_cached = self._decode_codebook_entry(
-                    self.combo_weights_V, combo_idx_V, atoms_V_bin
-                )
-            hard_codebook_U = codebook_U_cached.detach()
-            hard_codebook_V = codebook_V_cached.detach()
-
+            # AGI Alignment Loss: soft follows hard (hard is detached!)
+            # This creates gradient flow: alignment_loss -> soft_codebook -> atoms_U (DIRECT!)
             agi_loss_U = F.mse_loss(soft_codebook_U, hard_codebook_U.detach())
             agi_loss_V = F.mse_loss(soft_codebook_V, hard_codebook_V.detach())
             agi_alignment = (agi_loss_U + agi_loss_V) / 2.0
 
+            # AGI Diversity Loss: prevent atom collapse (via soft path)
             gram_U = soft_codebook_U @ soft_codebook_U.T
             gram_V = soft_codebook_V @ soft_codebook_V.T
             identity_U = torch.eye(gram_U.size(0), device=gram_U.device)
@@ -683,6 +678,7 @@ class TRILIXLinear(nn.Module):
             diversity_V = ((gram_V - identity_V) ** 2).mean()
             agi_diversity = (diversity_U + diversity_V) / 2.0
 
+            # Total AGI loss
             self._cached_agi_loss = (
                 self.agi_weight * agi_alignment + 0.01 * agi_diversity
             )
@@ -690,55 +686,16 @@ class TRILIXLinear(nn.Module):
             aux_losses["agi_alignment"] = agi_alignment
             aux_losses["agi_diversity"] = agi_diversity
             aux_losses["agi_total"] = self._cached_agi_loss
-
         else:
-            _device = x.device
-            aux_losses["agi_alignment"] = torch.tensor(0.0, device=_device)
-            aux_losses["agi_diversity"] = torch.tensor(0.0, device=_device)
-            aux_losses["agi_total"] = torch.tensor(0.0, device=_device)
-            self._cached_agi_loss = torch.tensor(0.0, device=_device)
+            aux_losses["agi_alignment"] = torch.tensor(0.0, device=output.device)
+            aux_losses["agi_diversity"] = torch.tensor(0.0, device=output.device)
+            aux_losses["agi_total"] = torch.tensor(0.0, device=output.device)
+            self._cached_agi_loss = torch.tensor(0.0, device=output.device)
 
-            latent = torch.matmul(x_scaled, V_hard)
-
-            if self.use_moe and self.moe_codebook_U is not None:
-                moe_out_U, moe_aux_U = self.moe_codebook_U(
-                    latent, self.xor_temperature.item()
-                )
-                moe_out_V, moe_aux_V = self.moe_codebook_V(
-                    latent, self.xor_temperature.item()
-                )
-                self.moe_codebook_U._cached_moe_aux_loss = moe_aux_U
-                self.moe_codebook_V._cached_moe_aux_loss = moe_aux_V
-                latent = latent + 0.05 * (moe_out_U + moe_out_V)
-                aux_losses["moe_aux_U"] = moe_aux_U
-                aux_losses["moe_aux_V"] = moe_aux_V
-
-            latent = latent * latent_scale
-            output = torch.matmul(latent, U_hard.T)
-            output = output * row_scale
-
-        _cu_atoms_U = (
-            self._cached_atoms_U_bin
-            if (
-                hasattr(self, "_cached_atoms_U_bin")
-                and self._cached_atoms_U_bin is not None
-            )
-            else None
-        )
-        _cu_atoms_V = (
-            self._cached_atoms_V_bin
-            if (
-                hasattr(self, "_cached_atoms_V_bin")
-                and self._cached_atoms_V_bin is not None
-            )
-            else None
-        )
-        if _cu_atoms_U is not None:
-            atoms_U_d, atoms_V_d = _cu_atoms_U, _cu_atoms_V
-        else:
-            atoms_U_d, atoms_V_d = self._get_atoms_binary()
-        atom_usage_U = atoms_U_d.view(-1, self.rank).abs().mean(1)
-        atom_usage_V = atoms_V_d.view(-1, self.rank).abs().mean(1)
+        # Atom diversity tracking (for monitoring)
+        atoms_U_bin, atoms_V_bin = self._get_atoms_binary()
+        atom_usage_U = atoms_U_bin.view(-1, self.rank).abs().mean(1)
+        atom_usage_V = atoms_V_bin.view(-1, self.rank).abs().mean(1)
         prob_U = F.softmax(atom_usage_U, dim=0)
         prob_V = F.softmax(atom_usage_V, dim=0)
         entropy_U = -(prob_U * torch.log(prob_U + 1e-10)).sum()
