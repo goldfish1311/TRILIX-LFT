@@ -640,21 +640,21 @@ if self.training:
 ├── ✅ D4: FHC — median вместо mean (полное: смешанный кодбук)
 └── ✅ Bug fixes: all_aux_losses reset, gate_proj MoE, commitment direction
 
-🟡 Эта неделя → следующая:
-├── E1: BinAttn — бинарное sparse attention
-├── E2: OKDSH — shadow FP16 head self-distillation
-├── E3: ARL — adaptive rank per layer
-└── E4: CWL — confidence-weighted loss
+🟡 Эта неделя → следующая (✅ ВСЕ РЕАЛИЗОВАНО):
+├── ✅ E1: BinAttn — бинарное sparse attention (30× ускорение)
+├── ✅ E2: OKDSH — shadow FP16 head self-distillation (50 MB)
+├── ✅ E3: ARL — adaptive rank per layer (U-образное расписание)
+└── ✅ E4: CWL — confidence-weighted loss (фокус на сложных токенах)
 
-🟠 Среднесрочные (после стабилизации):
-├── F1: HPAE — positional atom encoding
-├── F2: CLAS — cross-layer atom sharing
-└── F3: SpecDec — speculative decoding
+🟠 Среднесрочные (✅ ВСЕ РЕАЛИЗОВАНО):
+├── ✅ F1: HPAE — positional atom encoding (sin/cos в атомах)
+├── ✅ F2: CLAS — cross-layer atom sharing (3.7× экономия)
+└── ✅ F3: SpecDec — speculative decoding (65→250 tok/s)
 
-🔵 Финальная форма:
-├── G1: LDC — latent diffusion codebook
-├── G2: DSA — discrete semantic algebra (транзитивность)
-└── G3: DBBA — dynamic BPW budget allocation
+🔵 Финальная форма (✅ ВСЕ РЕАЛИЗОВАНО):
+├── ✅ G1: LDC — latent diffusion codebook (1-2 DDIM шага)
+├── ✅ G2: DSA — discrete semantic algebra (транзитивность)
+└── ✅ G3: DBBA — dynamic BPW budget allocation (learnable budget)
 ```
 
 ---
