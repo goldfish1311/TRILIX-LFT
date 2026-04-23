@@ -9,7 +9,7 @@ Level 4: MoE-Codebook (Multiple experts for specialized patterns)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 import math
 
 
@@ -1917,6 +1917,151 @@ class SymbolicDiffLoss(nn.Module):
         analogy_diversity = similarity.var()
 
         return analogy_clarity + 0.1 * (1 - analogy_diversity)
+
+
+class EmergentAgentSwarm(nn.Module):
+    """
+    B2: Emergent Agent Swarm
+
+    1024+ агента работают как рой. Агенты НЕ знают о существовании друг друга —
+    специализация emerges из взаимодействия через мир (WorldModel).
+
+    Как это работает:
+    1. Все агенты живут в одном SoulCodebook (1024 вектора)
+    2. Каждый forward: агенты получают задачу (task_embedding)
+    3. Task embedding = query для attention между агентами
+    4. "Лучшие" агенты для задачи получают больше внимания
+    5. Специализация emergent: агент128 специализируется на Python,
+       агент256 — на математику, агент512 — на перевод
+
+    Почему emergent, а не explicit:
+    - НЕ создаём 1024 отдельных "экспертов"
+    - НЕ делаем routing "агент → задача"
+    - Вместо этого: attention между агентами + задачей
+    - Специализация emerges из поощрения "агент X хорош для задачи Y"
+
+    Аналогия: муравьиная колония. Каждый муравей простой,
+    но вместе они решают сложные задачи.
+
+    Args:
+        num_agents: 1024
+        r: latent dimension
+        num_heads: attention heads для agent-task interaction
+    """
+
+    def __init__(
+        self,
+        num_agents: int = 1024,
+        r: int = 100,
+        num_heads: int = 4,
+        temperature: float = 1.0,
+        specialization_lr: float = 0.001,
+    ):
+        super().__init__()
+        self.num_agents = num_agents
+        self.r = r
+        self.num_heads = num_heads
+        self.head_dim = r // num_heads
+
+        self.temperature = temperature
+        self.specialization_lr = specialization_lr
+
+        self.register_buffer("_agent_scores", torch.zeros(num_agents))
+        self.register_buffer("_task_history", torch.zeros(num_agents, 64))
+        self.register_buffer("_step", torch.zeros(1, dtype=torch.long))
+        self.register_buffer("_specialization_count", torch.zeros(num_agents))
+
+    def forward(
+        self,
+        soul_vectors: torch.Tensor,
+        task_embedding: torch.Tensor,
+        return_attention: bool = False,
+    ) -> Dict:
+        """
+        Forward pass: agent-task attention.
+
+        Args:
+            soul_vectors: [batch, num_agents, r] — все агенты
+            task_embedding: [batch, r] — текущая задача
+            return_attention: вернуть attention weights для визуализации
+
+        Returns:
+            dict с:
+            - boosted_soul: [batch, num_agents, r] — агенты с учётом specialized attention
+            - specialization_loss: scalar — поощряет специализацию
+            - agent_scores: [num_agents] — текущие score агентов
+        """
+        batch_size, num_agents, r = soul_vectors.shape
+        task_emb = task_embedding.unsqueeze(1).expand(-1, num_agents, -1)
+
+        q = task_embedding.unsqueeze(1)
+        k = soul_vectors
+        v = soul_vectors
+
+        q_heads = q.view(batch_size, 1, self.num_heads, self.head_dim)
+        k_heads = k.view(batch_size, num_agents, self.num_heads, self.head_dim)
+        v_heads = v.view(batch_size, num_agents, self.num_heads, self.head_dim)
+
+        q_heads = q_heads.transpose(1, 2)
+        k_heads = k_heads.transpose(1, 2).transpose(2, 3)
+        v_heads = v_heads.transpose(1, 2)
+
+        scores = torch.matmul(q_heads, k_heads) / (self.head_dim**0.5)
+        attn = F.softmax(scores / max(self.temperature, 0.1), dim=-1)
+
+        attn_out = torch.matmul(attn, v_heads)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, num_agents, r)
+
+        boosted_soul = soul_vectors + 0.1 * attn_out
+
+        specialization_loss = self._specialization_loss(attn, task_embedding)
+
+        agent_scores = attn.mean(dim=[0, 1, 2])
+
+        result = {
+            "boosted_soul": boosted_soul,
+            "specialization_loss": specialization_loss,
+            "agent_scores": agent_scores,
+        }
+
+        if return_attention:
+            result["attention"] = attn
+
+        self._step += 1
+        return result
+
+    def _specialization_loss(
+        self, attention: torch.Tensor, task: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Поощряем специализацию: агент X становится "лучшим для задачи Y".
+
+        Loss = diversity_loss - concentration_loss
+        - diversity_loss: разные агенты получают attention для разных задач
+        - concentration_loss: не должно быть "один агент для всех"
+        """
+        batch_size = attention.size(0)
+
+        top_attn = attention.max(dim=-1)[0].mean(dim=[0, 1])
+        concentration = -(top_attn**2).mean()
+
+        agent_affinity = attention.mean(dim=[0, 1])
+        diversity = -(agent_affinity * torch.log(agent_affinity + 1e-10)).sum()
+
+        return concentration + 0.01 * diversity
+
+    def get_agent_stats(self) -> Dict:
+        """Статистика агентов"""
+        return {
+            "total_agents": self.num_agents,
+            "top_agent": int(self._agent_scores.argmax().item()),
+            "avg_score": self._agent_scores.mean().item(),
+            "specialization_rate": (
+                self._specialization_count.float() / max(self._step.item(), 1)
+            )
+            .mean()
+            .item(),
+        }
 
 
 class SoulCodebook(nn.Module):

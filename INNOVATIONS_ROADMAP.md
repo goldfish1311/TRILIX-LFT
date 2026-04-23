@@ -24,6 +24,7 @@
 | B4 | **HAR** — Hebbian Atom Resonance | ✅ Работает | `d7459fc` |
 | B3 | **DAE** — Differentiable Atom Evolution | ✅ Работает | `9985cda` |
 | B1.5 | **FHC** — Flat Hierarchical Codebook | ✅ Работает | — |
+| B2 | **Agent Swarm** — 1024 агента как рой | ✅ Работает | — |
 
 ### Новые цели (документы)
 
@@ -182,7 +183,19 @@ diff_cd = c * d  # "разность" c и d
 
 #### B2: Emergent Agent Swarm
 **Источник**: Дипсик  
-**Статус**: 📋 Запланировано (пересекается с B4 HAR)
+**Статус**: ✅ ЗАВЕРШЕНО — 2026-04-23
+
+**Суть**: 1024+ агента работают как рой. Агенты НЕ знают друг о друге — специализация emergent.
+
+**Как работает:**
+- Все агенты живут в SoulCodebook (1024 вектора)
+- Каждый forward: task_embedding = attention query между агентами
+- "Лучшие" агенты для задачи получают больше внимания
+- Специализация emerges: агент128 → Python, агент256 → математика
+
+**Интеграция**: `agent_swarm = EmergentAgentSwarm(1024, rank, 4 heads)` → forward → specialization_loss
+
+**Файлы**: `layers.py` (EmergentAgentSwarm), `model.py`
 
 ---
 

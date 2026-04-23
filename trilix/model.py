@@ -15,6 +15,7 @@ from .layers import (
     SoulCodebook,
     SymbolicDiffLoss,
     STEBinary,
+    EmergentAgentSwarm,
 )
 from .config import TRILIXConfig
 
@@ -331,9 +332,14 @@ class TRILIXTransformer(nn.Module):
         self.z_projector = nn.Linear(config.hidden_size, config.rank_r)
 
         # A1: Soul Codebook — файл "души" агента
-        # Один TRILIX = 1024 разных агента (переключение за 1 токен)
         self.soul_codebook = SoulCodebook(num_agents=1024, r=config.rank_r)
         self.soul_projector = nn.Linear(config.rank_r, config.hidden_size)
+
+        # B2: Emergent Agent Swarm — 1024 агента работают как рой
+        # Все агенты доступны через SoulCodebook, Swarm добавляет attention
+        self.agent_swarm = EmergentAgentSwarm(
+            num_agents=1024, r=config.rank_r, num_heads=4
+        )
 
         # B5: SDO — Symbolic Diff Operations для reasoning
         self.symbolic_diff_loss = SymbolicDiffLoss(rank=config.rank_r)
@@ -368,6 +374,8 @@ class TRILIXTransformer(nn.Module):
         """
         batch_size, seq_len = input_ids.shape
 
+        all_aux_losses = {}
+
         # Embeddings
         hidden_states = self.embed_tokens(input_ids)
 
@@ -379,7 +387,30 @@ class TRILIXTransformer(nn.Module):
             )
         soul_vector = self.soul_codebook(soul_id)  # [batch, rank]
         soul_vector = self.soul_projector(soul_vector)  # [batch, hidden_size]
-        # Добавляем soul к hidden_states (broadcast по seq_len)
+
+        # B2: Emergent Agent Swarm — агент получает attention от других агентов
+        if self.training:
+            all_soul = self.soul_codebook.soul_vectors.weight  # [1024, rank]
+            task_emb = hidden_states.mean(dim=1)  # [batch, hidden]
+            task_emb_low = self.z_projector(task_emb)  # [batch, rank]
+            task_emb_expanded = task_emb_low.unsqueeze(1).expand(
+                -1, all_soul.size(0), -1
+            )
+            all_soul_expanded = all_soul.unsqueeze(0).expand(batch_size, -1, -1)
+            swarm_result = self.agent_swarm(all_soul_expanded, task_emb_low)
+            swarm_boost = swarm_result["boosted_soul"]
+            agent_idx = (
+                soul_id.unsqueeze(-1).expand(-1, self.config.rank_r).unsqueeze(1)
+            )
+            swarm_soul = torch.gather(swarm_boost, 1, agent_idx).squeeze(1)
+            swarm_soul_proj = self.soul_projector(swarm_soul)
+            hidden_states = hidden_states + swarm_soul_proj.unsqueeze(1) * 0.05
+            all_aux_losses["swarm_specialization"] = swarm_result["specialization_loss"]
+        else:
+            all_aux_losses["swarm_specialization"] = torch.tensor(
+                0.0, device=hidden_states.device
+            )
+
         hidden_states = hidden_states + soul_vector.unsqueeze(1) * 0.1
 
         # Prepare attention mask
