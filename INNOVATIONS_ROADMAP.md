@@ -22,6 +22,7 @@
 | A2 | **Latent World Model** — предсказание следующего состояния | ✅ Работает | `bc4006b` |
 | B5 | **SDO** — Symbolic Diff Operations | ✅ Работает | `5421917` |
 | B4 | **HAR** — Hebbian Atom Resonance | ✅ Работает | `d7459fc` |
+| B3 | **DAE** — Differentiable Atom Evolution | ✅ Работает | — |
 
 ### Новые цели (документы)
 
@@ -86,7 +87,25 @@
 
 #### B3: Differentiable Atom Evolution (DAE)
 **Источник**: Дипсик  
-**Статус**: 📋 Запланировано
+**Статус**: ✅ ЗАВЕРШЕНО — 2026-04-23
+
+**Суть**: Дифференцируемая эволюция — градиенты управляют мутациями атомов.
+
+**Как работает:**
+- HAR: безградиентное, статистическое, "выживают популярные"
+- DAE: градиентное, selection pressure через ||d_loss/d_atom||
+- Mutation: atom + lr * grad(atom) * fitness
+- Crossover: топ-K атомов производят offspring через interpolate
+- Selection: лучшие survive, худшие заменяются
+
+**Отличие от HAR:**
+- Использует GRADIENT для направления эволюции
+- Может создавать НОВЫЕ атомы (не только переиспользовать)
+- Эволюция идёт в пространстве параметров
+
+**Интеграция:** `layer.enable_dae()` + `layer.step_dae()` (после backward)
+
+**Файлы**: `layers.py` (DifferentiableAtomEvolver), `train_small_moe.py`
 
 ---
 

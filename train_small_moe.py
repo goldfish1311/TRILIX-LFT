@@ -85,6 +85,15 @@ for layer in model.modules():
         har_layer_count += 1
 log(f"  HAR enabled on {har_layer_count} TRILIXLinear layers")
 
+# B3: Enable Differentiable Atom Evolution (DAE) on all TRILIXLinear layers
+log("\nB3: Enabling Differentiable Atom Evolution (DAE)...")
+dae_layer_count = 0
+for layer in model.modules():
+    if hasattr(layer, "enable_dae"):
+        layer.enable_dae(evolution_interval=500, selection_threshold=0.1)
+        dae_layer_count += 1
+log(f"  DAE enabled on {dae_layer_count} TRILIXLinear layers")
+
 # Optimizer - differential learning rates
 scale_params = []
 binary_params = []
@@ -235,6 +244,12 @@ while step < max_steps:
 
         # Backward
         total_loss.backward()
+
+        # B3: DAE — observe gradients and evolve atoms (after backward!)
+        for layer in model.modules():
+            if hasattr(layer, "step_dae"):
+                layer.step_dae(total_loss.item())
+
         accumulated_loss += total_loss.item()
 
         # Check gradients on very first backward only

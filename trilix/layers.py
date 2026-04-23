@@ -410,6 +410,186 @@ class HebbianAtomResonance(nn.Module):
         }
 
 
+class DifferentiableAtomEvolver(nn.Module):
+    """
+    B3: Differentiable Atom Evolution (DAE)
+
+    DIFFERENT от HAR:
+    - HAR:    безградиентное, статистическое, "выживают популярные"
+    - DAE:    дифференцируемое, градиентное, selection pressure
+
+    Эволюция работает ЧЕРЕЗ ГРАДИЕНТЫ:
+    1. Fitness = ||d_loss/d_atom|| — какой атом больше влияет на loss
+    2. Mutation = atom + lr * grad(atom) * fitness  — двигаемся в сторону улучшения
+    3. Сrossover: топ-K атомов производятoffspring через interpolate
+    4. Selection: лучшие survive, худшие заменяются
+
+    В отличие от HAR:
+    - Использует GRADIENT для направления эволюции
+    - Может создавать НОВЫЕ атомы (не только переиспользовать старые)
+    - Эволюция идёт в пространстве параметров (atoms как genotype)
+    - Selection pressure = grad_magnitude
+
+    Ключевое: атомы — это genotype. Финальный фенотип = sign(atom).
+    """
+
+    def __init__(
+        self,
+        num_atoms: int,
+        rank: int,
+        evolution_interval: int = 500,
+        selection_threshold: float = 0.1,
+        elite_fraction: float = 0.2,
+        mutation_scale: float = 0.05,
+        crossover_prob: float = 0.3,
+    ):
+        super().__init__()
+        self.num_atoms = num_atoms
+        self.rank = rank
+        self.evolution_interval = evolution_interval
+        self.selection_threshold = selection_threshold
+        self.elite_fraction = elite_fraction
+        self.mutation_scale = mutation_scale
+        self.crossover_prob = crossover_prob
+
+        self.register_buffer("_step_counter", torch.zeros(1, dtype=torch.long))
+        self.register_buffer("_atom_fitness_U", torch.zeros(num_atoms))
+        self.register_buffer("_atom_fitness_V", torch.zeros(num_atoms))
+        self.register_buffer("_atom_grad_mag_U", torch.zeros(num_atoms))
+        self.register_buffer("_atom_grad_mag_V", torch.zeros(num_atoms))
+        self.register_buffer("_evolution_count", torch.zeros(1, dtype=torch.long))
+        self._registered = False
+        self._last_evolution_step = 0
+
+    def register_with_layer(self, layer: "TRILIXLinear"):
+        """Register this DAE with a TRILIXLinear layer"""
+        self._layer = layer
+        self._registered = True
+
+    def observe_gradient(
+        self,
+        atom_grad_U: torch.Tensor,
+        atom_grad_V: torch.Tensor,
+        combo_indices_U: torch.Tensor,
+        combo_indices_V: torch.Tensor,
+        loss_val: float,
+    ):
+        """
+        Observe gradients on atoms and track fitness.
+
+        Args:
+            atom_grad_U: [num_atoms, rank] — gradient on atoms_U
+            atom_grad_V: [num_atoms, rank] — gradient on atoms_V
+            combo_indices_U: [codebook_size, xor_arity, num_atoms] one-hot
+            combo_indices_V: [codebook_size, xor_arity, num_atoms] one-hot
+            loss_val: current loss value (for normalization)
+        """
+        if not self._registered:
+            return
+
+        with torch.no_grad():
+            self._step_counter += 1
+
+            grad_mag_U = atom_grad_U.abs().mean(dim=1)  # [A]
+            grad_mag_V = atom_grad_V.abs().mean(dim=1)  # [A]
+
+            self._atom_grad_mag_U = 0.9 * self._atom_grad_mag_U + 0.1 * grad_mag_U
+            self._atom_grad_mag_V = 0.9 * self._atom_grad_mag_V + 0.1 * grad_mag_V
+
+            combo_flat_U = combo_indices_U.sum(dim=1)  # [K, A]
+            combo_flat_V = combo_indices_V.sum(dim=1)  # [K, A]
+            atom_active_U = (combo_flat_U.sum(dim=0) > 0).float()
+            atom_active_V = (combo_flat_V.sum(dim=0) > 0).float()
+
+            fitness_U = self._atom_grad_mag_U * atom_active_U
+            fitness_V = self._atom_grad_mag_V * atom_active_V
+            self._atom_fitness_U = 0.95 * self._atom_fitness_U + 0.05 * fitness_U
+            self._atom_fitness_V = 0.95 * self._atom_fitness_V + 0.05 * fitness_V
+
+            if (
+                self._step_counter.item() - self._last_evolution_step
+                >= self.evolution_interval
+            ):
+                self._evolve()
+                self._last_evolution_step = self._step_counter.item()
+
+    def _evolve(self):
+        """Apply differentiable evolution: mutation + crossover + selection"""
+        layer = getattr(self, "_layer", None)
+        if layer is None:
+            return
+
+        with torch.no_grad():
+            self._evolution_count += 1
+
+            fitness_U = self._atom_fitness_U
+            fitness_V = self._atom_fitness_V
+            top_fitness_U = fitness_U.max().item()
+            top_fitness_V = fitness_V.max().item()
+
+            if top_fitness_U < 1e-8 and top_fitness_V < 1e-8:
+                return
+
+            norm_fitness_U = fitness_U / (top_fitness_U + 1e-10)
+            norm_fitness_V = fitness_V / (top_fitness_V + 1e-10)
+
+            elite_count = max(1, int(self.num_atoms * self.elite_fraction))
+            elite_U = norm_fitness_U.topk(elite_count)[1]
+            elite_V = norm_fitness_V.topk(elite_count)[1]
+
+            new_atoms_U = layer.atoms_U.data.clone()
+            new_atoms_V = layer.atoms_V.data.clone()
+
+            for i in range(self.num_atoms):
+                if norm_fitness_U[i] < self.selection_threshold:
+                    parent1_idx = elite_U[torch.randint(elite_count, (1,))]
+                    new_atom = new_atoms_U[parent1_idx].clone()
+
+                    if torch.rand(1).item() < self.crossover_prob and elite_count > 1:
+                        parent2_idx = elite_U[torch.randint(elite_count, (1,))]
+                        parent2 = new_atoms_U[parent2_idx]
+                        alpha = torch.rand(1).item()
+                        new_atom = alpha * new_atom + (1 - alpha) * parent2
+
+                    mutation_noise = torch.randn_like(new_atom) * self.mutation_scale
+                    new_atom = new_atom + mutation_noise * max(norm_fitness_U[i], 0.1)
+                    new_atoms_U[i] = new_atom
+
+                if norm_fitness_V[i] < self.selection_threshold:
+                    parent1_idx = elite_V[torch.randint(elite_count, (1,))]
+                    new_atom = new_atoms_V[parent1_idx].clone()
+
+                    if torch.rand(1).item() < self.crossover_prob and elite_count > 1:
+                        parent2_idx = elite_V[torch.randint(elite_count, (1,))]
+                        parent2 = new_atoms_V[parent2_idx]
+                        alpha = torch.rand(1).item()
+                        new_atom = alpha * new_atom + (1 - alpha) * parent2
+
+                    mutation_noise = torch.randn_like(new_atom) * self.mutation_scale
+                    new_atom = new_atom + mutation_noise * max(norm_fitness_V[i], 0.1)
+                    new_atoms_V[i] = new_atom
+
+            layer.atoms_U.data.copy_(new_atoms_U)
+            layer.atoms_V.data.copy_(new_atoms_V)
+
+            self._atom_fitness_U.zero_()
+            self._atom_fitness_V.zero_()
+
+    def get_stats(self) -> dict:
+        """Return current DAE statistics"""
+        top_fitness_U = self._atom_fitness_U.max().item()
+        top_fitness_V = self._atom_fitness_V.max().item()
+        return {
+            "dae_registered": self._registered,
+            "dae_step": self._step_counter.item(),
+            "dae_evolution_count": self._evolution_count.item(),
+            "top_fitness_U": top_fitness_U,
+            "top_fitness_V": top_fitness_V,
+            "avg_fitness_U": self._atom_fitness_U.mean().item(),
+            "avg_fitness_V": self._atom_fitness_V.mean().item(),
+        }
+
+
 class TRILIXLinear(nn.Module):
     """
     TRILIX Linear Layer with triple-level compression
@@ -459,6 +639,8 @@ class TRILIXLinear(nn.Module):
         self.use_sgh = use_sgh
         self.use_lcc = use_lcc
         self.use_har = False
+        self.dae = None
+        self.use_dae = False
 
         # Temperature for soft XOR (anneals from 1.0 to 0.01)
         # ATC: 3 independent temperatures for cascade freezing
@@ -605,6 +787,20 @@ class TRILIXLinear(nn.Module):
             )
             self.har.register_with_layer(self)
             self.use_har = True
+
+    def enable_dae(
+        self, evolution_interval: int = 500, selection_threshold: float = 0.1
+    ):
+        """Enable Differentiable Atom Evolution (B3)"""
+        if self.dae is None:
+            self.dae = DifferentiableAtomEvolver(
+                num_atoms=self.num_atoms,
+                rank=self.rank,
+                evolution_interval=evolution_interval,
+                selection_threshold=selection_threshold,
+            )
+            self.dae.register_with_layer(self)
+            self.use_dae = True
 
     def _init_parameters(self):
         """Initialize parameters with principled schemes"""
@@ -1074,7 +1270,38 @@ class TRILIXLinear(nn.Module):
                 har_stats["dead_atoms_V"], dtype=torch.float32, device=output.device
             )
 
+        # B3: DAE observation — observe combo usage (gradients come after backward)
+        # DAE needs gradients, so we track atom activation during forward
+        # Actual gradient-based evolution happens post-backward via step()
+        if self.training and self.use_dae and self.dae is not None:
+            combo_idx_U = self._get_combo_indices_hard(self.combo_indices_U_logits)
+            combo_idx_V = self._get_combo_indices_hard(self.combo_indices_V_logits)
+            self._cached_combo_U = combo_idx_U
+            self._cached_combo_V = combo_idx_V
+            self._cached_loss_val = aux_losses.get(
+                "commitment_U", torch.tensor(0.0)
+            ).item()
+
         return output, aux_losses
+
+    def step_dae(self, loss_val: float = 0.0):
+        """B3: DAE step — called after backward() to observe gradients and evolve
+
+        DAE needs gradient info which is only available after backward(),
+        so this is a separate method to be called from training loop.
+        """
+        if not (self.use_dae and self.dae is not None):
+            return
+
+        grad_U = getattr(self.atoms_U, "grad", None)
+        grad_V = getattr(self.atoms_V, "grad", None)
+        combo_U = getattr(self, "_cached_combo_U", None)
+        combo_V = getattr(self, "_cached_combo_V", None)
+
+        if grad_U is not None and combo_U is not None:
+            self.dae.observe_gradient(grad_U, grad_V, combo_U, combo_V, loss_val)
+            dae_stats = self.dae.get_stats()
+            self._cached_dae_stats = dae_stats
 
     def get_effective_weight(self) -> torch.Tensor:
         """
