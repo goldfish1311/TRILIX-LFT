@@ -100,27 +100,32 @@ for layer in model.modules():
         dae_layer_count += 1
 log(f"  DAE enabled on {dae_layer_count} TRILIXLinear layers")
 
-# Optimizer - differential learning rates
-scale_params = []
-binary_params = []
-moe_params = []
-world_model_params = []
-soul_params = []
-other_params = []
+# Optimizer - differential learning rates + per-group gradient clipping (D2)
+    scale_params = []           # clip 0.5 (строгий — быстро учатся)
+    atom_params = []            # clip 2.0 (мягкий — медленная эволюция)
+    idx_params = []             # clip 1.0 (стандартный — idx_logits, combo_indices)
+    moe_params = []             # clip 1.0
+    world_model_params = []      # clip 1.0
+    soul_params = []             # clip 1.0
+    other_params = []            # clip 1.0
 
-for name, param in model.named_parameters():
-    if "scale" in name and "latent" not in name:
-        scale_params.append(param)
-    elif "moe" in name or "expert" in name or "router" in name:
-        moe_params.append(param)
-    elif "world_model" in name or "z_projector" in name or "soul_projector" in name:
-        world_model_params.append(param)
-    elif "soul_codebook" in name:
-        soul_params.append(param)
-    elif "atoms" in name or "idx_" in name or "combo_" in name:
-        binary_params.append(param)
-    else:
-        other_params.append(param)
+    for name, param in model.named_parameters():
+        if "scale" in name and "latent" not in name:
+            scale_params.append(param)
+        elif "atoms" in name:  # atoms_U, atoms_V — медленная эволюция
+            atom_params.append(param)
+        elif "idx_" in name or "combo_" in name:  # индекс-логиты
+            idx_params.append(param)
+        elif "moe" in name or "expert" in name or "router" in name:
+            moe_params.append(param)
+        elif "world_model" in name or "z_projector" in name:
+            world_model_params.append(param)
+        elif "soul_projector" in name:
+            soul_params.append(param)
+        elif "soul_codebook" in name:
+            soul_params.append(param)
+        else:
+            other_params.append(param)
 
 optimizer = torch.optim.AdamW(
     [
@@ -273,11 +278,27 @@ while step < max_steps:
                 f"CE={ce_loss.item():.4f} | VRAM={vram_gb:.1f}GB"
             )
 
-    # Gradient clip
+    # D2: Per-group gradient clipping
+    # Scale — строгий клиппинг (быстро учатся, не должны "убегать")
     torch.nn.utils.clip_grad_norm_(scale_params, max_norm=0.5)
-    torch.nn.utils.clip_grad_norm_(moe_params, max_norm=1.0)
-    torch.nn.utils.clip_grad_norm_(binary_params, max_norm=1.0)
-    torch.nn.utils.clip_grad_norm_(other_params, max_norm=1.0)
+    # Atoms — мягкий клиппинг (медленная эволюция, нужно больше сигнала)
+    if atom_params:
+        torch.nn.utils.clip_grad_norm_(atom_params, max_norm=2.0)
+    # Index logits — стандартный
+    if idx_params:
+        torch.nn.utils.clip_grad_norm_(idx_params, max_norm=1.0)
+    # MoE
+    if moe_params:
+        torch.nn.utils.clip_grad_norm_(moe_params, max_norm=1.0)
+    # World Model
+    if world_model_params:
+        torch.nn.utils.clip_grad_norm_(world_model_params, max_norm=1.0)
+    # Soul
+    if soul_params:
+        torch.nn.utils.clip_grad_norm_(soul_params, max_norm=1.0)
+    # Остальное
+    if other_params:
+        torch.nn.utils.clip_grad_norm_(other_params, max_norm=1.0)
 
     optimizer.step()
     optimizer.zero_grad()
