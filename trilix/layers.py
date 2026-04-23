@@ -142,13 +142,20 @@ class FlatHierarchicalMoE(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, r = x_latent.shape
 
-        # Get meta and base expert codebooks (centroids)
+        # D4 FIX: Get meta and base expert codebooks (D4: representative vectors, not centroids)
         meta_codebooks = [e.get_codewords(temperature) for e in self.meta_experts]
         base_codebooks = [e.get_codewords(temperature) for e in self.base_experts]
         # Each: [k, r]
 
-        meta_centroids = torch.stack([cb.mean(dim=0) for cb in meta_codebooks], dim=0)
-        base_centroids = torch.stack([cb.mean(dim=0) for cb in base_codebooks], dim=0)
+        # D4 FIX: Use representative vectors (median) instead of centroids (mean)
+        # mean(dim=0) схлопывает 128 кодслов в 1 вектор — теряет всю структуру!
+        # median(dim=0) берёт "типичный" вектор, сохраняя больше информации
+        meta_centroids = torch.stack(
+            [cb.median(dim=0).values for cb in meta_codebooks], dim=0
+        )
+        base_centroids = torch.stack(
+            [cb.median(dim=0).values for cb in base_codebooks], dim=0
+        )
 
         meta_centroids = F.normalize(meta_centroids, dim=1)
         base_centroids = F.normalize(base_centroids, dim=1)
