@@ -1104,14 +1104,29 @@ class TRILIXLinear(nn.Module):
                 0, idx_U_hard_idx, torch.ones_like(idx_U_hard_idx, dtype=torch.long)
             )
 
-            # EMA update of codebook
-            for i in range(self.codebook_size):
-                mask = idx_U_hard_idx == i
-                if mask.any():
-                    self.codebook_U_ema[i] = self.atom_ema_decay * self.codebook_U_ema[
-                        i
-                    ] + (1 - self.atom_ema_decay) * U_hard[mask].mean(0)
-                    self.codebook_U_count[i] += 1
+        # EMA update of codebook — VECTORIZED (D1 fix)
+        # Было: for i in range(self.codebook_size) — 128 Python итераций за слой
+        # Стало: один scatter_add_ — GPU kernel
+        # 168 слоёв × 128 = 21,504 → 168 GPU операций
+        counts = torch.bincount(idx_U_hard_idx, minlength=self.codebook_size).float()
+
+        # Накопить суммы через scatter_add
+        sums = torch.zeros(self.codebook_size, self.rank, device=U_hard.device)
+        sums.scatter_add_(
+            0,
+            idx_U_hard_idx.unsqueeze(-1).expand(-1, self.rank),
+            U_hard,
+        )
+
+        # EMA только для активных кодслов
+        active = counts > 0
+        if active.any():
+            new_means = sums[active] / counts[active].unsqueeze(-1)
+            self.codebook_U_ema[active] = (
+                self.atom_ema_decay * self.codebook_U_ema[active]
+                + (1 - self.atom_ema_decay) * new_means
+            )
+            self.codebook_U_count[active] += 1
 
         # Use hard for forward, soft for backward (via STE implicitly)
         U_final = STEIndex.apply(U_soft, U_hard)
@@ -1147,13 +1162,22 @@ class TRILIXLinear(nn.Module):
                 0, idx_V_hard_idx, torch.ones_like(idx_V_hard_idx, dtype=torch.long)
             )
 
-            for i in range(self.codebook_size):
-                mask = idx_V_hard_idx == i
-                if mask.any():
-                    self.codebook_V_ema[i] = self.atom_ema_decay * self.codebook_V_ema[
-                        i
-                    ] + (1 - self.atom_ema_decay) * V_hard[mask].mean(0)
-                    self.codebook_V_count[i] += 1
+        # EMA update of codebook — VECTORIZED (D1 fix)
+        counts = torch.bincount(idx_V_hard_idx, minlength=self.codebook_size).float()
+        sums = torch.zeros(self.codebook_size, self.rank, device=V_hard.device)
+        sums.scatter_add_(
+            0,
+            idx_V_hard_idx.unsqueeze(-1).expand(-1, self.rank),
+            V_hard,
+        )
+        active = counts > 0
+        if active.any():
+            new_means = sums[active] / counts[active].unsqueeze(-1)
+            self.codebook_V_ema[active] = (
+                self.atom_ema_decay * self.codebook_V_ema[active]
+                + (1 - self.atom_ema_decay) * new_means
+            )
+            self.codebook_V_count[active] += 1
 
         V_final = STEIndex.apply(V_soft, V_hard)
 
